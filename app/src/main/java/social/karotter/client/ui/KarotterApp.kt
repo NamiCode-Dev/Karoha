@@ -3,6 +3,7 @@ package social.karotter.client.ui
 import android.Manifest
 import android.app.Activity
 import android.content.pm.PackageManager
+import android.graphics.Paint
 import android.graphics.drawable.Animatable as DrawableAnimatable
 import android.media.MediaPlayer
 import android.content.Intent
@@ -16,11 +17,14 @@ import android.os.SystemClock
 import android.provider.Settings
 import android.provider.OpenableColumns
 import android.text.Spannable
+import android.text.SpannableStringBuilder
 import android.text.TextUtils
 import android.text.method.LinkMovementMethod
 import android.text.style.ClickableSpan
+import android.text.style.ReplacementSpan
 import android.view.MotionEvent
 import android.widget.TextView
+import android.widget.Toast
 import android.widget.VideoView
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -56,6 +60,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
@@ -94,6 +102,8 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -176,6 +186,7 @@ import kotlinx.coroutines.flow.filter
 import coil.compose.AsyncImage
 import coil.compose.AsyncImagePainter
 import coil.imageLoader
+import java.net.URL
 import io.noties.markwon.LinkResolver
 import io.noties.markwon.Markwon
 import io.noties.markwon.SoftBreakAddsNewLinePlugin
@@ -353,12 +364,17 @@ private val LocalHashtagHandler = staticCompositionLocalOf<((String) -> Unit)?> 
 private val LocalReactionHandler = staticCompositionLocalOf<((Post, String, Boolean) -> Unit)?> { null }
 private val LocalPollVoteHandler = staticCompositionLocalOf<((Post, Long, (ApiPoll?) -> Unit) -> Unit)?> { null }
 private val LocalRekarotStates = staticCompositionLocalOf<Map<Long, RekarotState>> { emptyMap() }
+private val LocalPostInteractionStates = staticCompositionLocalOf<Map<Long, PostInteractionState>> { emptyMap() }
 private val LocalPostMenuEnvironment = staticCompositionLocalOf<PostMenuEnvironment?> { null }
 private val LocalPostMenuResultHandler = staticCompositionLocalOf<((PostMenuAction, Post) -> Unit)?> { null }
 private val LocalNavigationActive = staticCompositionLocalOf { true }
 private val LocalLinkPreviewApi = staticCompositionLocalOf<KarotterApi?> { null }
 
 private data class RekarotState(val rekaroted: Boolean, val count: Int)
+private data class PostInteractionState(
+    val liked: Boolean? = null,
+    val bookmarked: Boolean? = null
+)
 
 private data class HorizontalTabMotion(val shiftDp: Float, val alpha: Float)
 
@@ -486,7 +502,8 @@ private data class Post(
     val viewsCount: Int = 0,
     val bookmarksCount: Int = 0,
     val quoteUsersCount: Int = 0,
-    val parentId: Long? = null
+    val parentId: Long? = null,
+    val canQuote: Boolean = true
 )
 
 private fun postStableKey(post: Post): String =
@@ -842,10 +859,21 @@ fun KarotterApp(
             },
             onLogout = {
                 scope.launch {
-                    BackgroundNotificationManager.onLoggedOut(context)
-                    withContext(Dispatchers.IO) { api.logout() }
+                    val nextAccount = withContext(Dispatchers.IO) {
+                        api.logout()
+                        api.savedAccounts().firstOrNull()?.let { account ->
+                            api.switchAccount(account.identifier)
+                        }
+                    }
                     returnAccountIdentifier = null
-                    user = null
+                    if (nextAccount is ApiResult.Success) {
+                        user = nextAccount.value
+                        dataFailure = null
+                        BackgroundNotificationManager.onLoginSucceeded(context)
+                    } else {
+                        user = null
+                        BackgroundNotificationManager.onLoggedOut(context)
+                    }
                 }
             },
             onAccountChanged = {
@@ -956,6 +984,7 @@ private fun MainShell(
     onAddAccount: () -> Unit
 ) {
     val rekarotStates = remember { mutableStateMapOf<Long, RekarotState>() }
+    val postInteractionStates = remember { mutableStateMapOf<Long, PostInteractionState>() }
     val context = LocalContext.current
     var section by remember { mutableStateOf(Section.HOME) }
     var sectionHistory by remember { mutableStateOf<List<Section>>(emptyList()) }
@@ -1069,10 +1098,34 @@ private fun MainShell(
         }
 
     fun mergeTimeline(incoming: List<ApiPost>) {
+        val refreshed = uniqueTimelinePosts(incoming)
+        val refreshedById = refreshed.mapNotNull { post -> post.id?.let { it to post } }.toMap()
+        refreshedById.forEach { (postId, freshPost) ->
+            postInteractionStates[postId]?.let { pending ->
+                val reconciled = pending.copy(
+                    liked = pending.liked?.takeUnless { it == freshPost.initiallyLiked },
+                    bookmarked = pending.bookmarked?.takeUnless { it == freshPost.initiallyBookmarked }
+                )
+                if (reconciled.liked == null && reconciled.bookmarked == null) {
+                    postInteractionStates.remove(postId)
+                } else {
+                    postInteractionStates[postId] = reconciled
+                }
+            }
+            rekarotStates[postId]?.let { pending ->
+                if (pending.rekaroted == freshPost.initiallyRekaroted) {
+                    rekarotStates.remove(postId)
+                }
+            }
+        }
         val existingIds = posts.mapNotNullTo(hashSetOf()) { it.id }
-        val additions = uniqueTimelinePosts(incoming).filter { it.id == null || it.id !in existingIds }
-        if (additions.isNotEmpty()) {
-            posts = (additions + posts).distinctBy(::postStableKey)
+        val additions = refreshed.filter { it.id == null || it.id !in existingIds }
+        val updatedVisiblePosts = posts.map { current ->
+            current.id?.let(refreshedById::get) ?: current
+        }
+        val merged = (additions + updatedVisiblePosts).distinctBy(::postStableKey)
+        if (merged != posts) {
+            posts = merged
             homePostCache = homePostCache + ("$homeMode:$homeRanking" to posts)
         }
     }
@@ -1319,6 +1372,10 @@ private fun MainShell(
     }
 
     fun openComposer(parent: Post? = null, quote: Post? = null, community: ApiCommunity? = null, question: ApiQuestion? = null) {
+        if (quote != null && (quote.isPrivateAccount || !quote.canQuote)) {
+            Toast.makeText(context, "非公開アカウントの投稿は引用できません", Toast.LENGTH_SHORT).show()
+            return
+        }
         composeTarget = ComposeTarget(parent = parent, quote = quote, community = community, question = question)
         composerOpen = true
     }
@@ -1329,16 +1386,30 @@ private fun MainShell(
     }
 
     fun like(post: Post, desired: Boolean) {
+        val postId = post.id ?: return
+        val previous = postInteractionStates[postId]
+        postInteractionStates[postId] = (previous ?: PostInteractionState()).copy(liked = desired)
         scope.launch {
-            val result = withContext(Dispatchers.IO) { api.like(post.id ?: return@withContext ApiResult.Failure("投稿IDがありません"), desired) }
-            if (result is ApiResult.Failure) error = result.message
+            val result = withContext(Dispatchers.IO) { api.like(postId, desired) }
+            if (result is ApiResult.Failure) {
+                if (previous == null) postInteractionStates.remove(postId)
+                else postInteractionStates[postId] = previous
+                error = result.message
+            }
         }
     }
 
     fun bookmark(post: Post, desired: Boolean) {
+        val postId = post.id ?: return
+        val previous = postInteractionStates[postId]
+        postInteractionStates[postId] = (previous ?: PostInteractionState()).copy(bookmarked = desired)
         scope.launch {
-            val result = withContext(Dispatchers.IO) { api.bookmark(post.id ?: return@withContext ApiResult.Failure("投稿IDがありません"), desired) }
-            if (result is ApiResult.Failure) error = result.message
+            val result = withContext(Dispatchers.IO) { api.bookmark(postId, desired) }
+            if (result is ApiResult.Failure) {
+                if (previous == null) postInteractionStates.remove(postId)
+                else postInteractionStates[postId] = previous
+                error = result.message
+            }
         }
     }
 
@@ -1462,6 +1533,7 @@ private fun MainShell(
         LocalReactionHandler provides ::react,
         LocalPollVoteHandler provides ::votePoll,
         LocalRekarotStates provides rekarotStates,
+        LocalPostInteractionStates provides postInteractionStates,
         LocalLinkPreviewApi provides api,
         LocalPostMenuEnvironment provides PostMenuEnvironment(currentUser?.id, ::executePostMenuAction, ::openPostEditor)
     ) {
@@ -1818,7 +1890,8 @@ private fun ApiPost.toUiPost(): Post = Post(
     viewsCount = viewsCount,
     bookmarksCount = bookmarksCount,
     quoteUsersCount = quoteUsersCount,
-    parentId = parentId
+    parentId = parentId,
+    canQuote = canQuote
 )
 
 private fun ApiUser.toProfilePost() = Post(
@@ -3357,11 +3430,11 @@ private fun PostCard(
     showAbsoluteTime: Boolean = false,
     onQuotedOpen: ((Post) -> Unit)? = null
 ) {
-    var liked by remember(post.id, post.initiallyLiked) { mutableStateOf(post.initiallyLiked) }
+    var localLiked by remember(post.id) { mutableStateOf(post.initiallyLiked) }
     var localRekaroted by remember(post.id, post.initiallyRekaroted) { mutableStateOf(post.initiallyRekaroted) }
-    var bookmarked by remember(post.id, post.initiallyBookmarked) { mutableStateOf(post.initiallyBookmarked) }
-    var reactions by remember(post.id, post.reactions) { mutableStateOf(post.reactions) }
-    var poll by remember(post.id, post.poll) { mutableStateOf(post.poll) }
+    var localBookmarked by remember(post.id) { mutableStateOf(post.initiallyBookmarked) }
+    var reactions by remember(post.id) { mutableStateOf(post.reactions) }
+    var poll by remember(post.id) { mutableStateOf(post.poll) }
     var reactionPickerOpen by remember(post.id) { mutableStateOf(false) }
     var textExpanded by remember(post.id, post.text) { mutableStateOf(false) }
     var confirmRekarot by remember(post.id) { mutableStateOf(false) }
@@ -3376,6 +3449,9 @@ private fun PostCard(
     val postMenuResultHandler = LocalPostMenuResultHandler.current
     val isOwnPost = postMenuEnvironment?.viewerId != null && postMenuEnvironment.viewerId == post.authorId
     val linkPreviewUrl = remember(post.text) { firstPostUrl(post.text) }
+    val sharedInteractionState = post.id?.let { LocalPostInteractionStates.current[it] }
+    val liked = sharedInteractionState?.liked ?: localLiked
+    val bookmarked = sharedInteractionState?.bookmarked ?: localBookmarked
     val sharedRekarotState = post.id?.let { LocalRekarotStates.current[it] }
     val rekaroted = sharedRekarotState?.rekaroted ?: localRekaroted
     val rekarotsCount = sharedRekarotState?.count ?: (
@@ -3722,10 +3798,20 @@ private fun PostCard(
                         KText(rekarotsCount.toString(), 11, if (rekaroted) Carrot else Muted, FontWeight.Medium)
                     }
                     Spacer(Modifier.width(9.dp))
-                    Box(Modifier.clip(RoundedCornerShape(10.dp)).clickable(enabled = onQuote != null) { onQuote?.invoke(post) }.padding(4.dp)) { KText("❝", 17, Muted, FontWeight.Bold) }
+                    val quoteAllowed = onQuote != null && post.canQuote && !post.isPrivateAccount
+                    Box(
+                        Modifier.clip(RoundedCornerShape(10.dp))
+                            .clickable(enabled = quoteAllowed) { onQuote?.invoke(post) }
+                            .padding(4.dp)
+                    ) {
+                        KText("❝", 17, if (quoteAllowed) Muted else Hairline, FontWeight.Bold)
+                    }
                     Spacer(Modifier.width(9.dp))
                     Row(
-                        Modifier.scale(likeScale).clip(RoundedCornerShape(12.dp)).clickable(enabled = onLike != null) { liked = !liked; onLike?.invoke(liked) }.padding(4.dp),
+                        Modifier.scale(likeScale).clip(RoundedCornerShape(12.dp)).clickable(enabled = onLike != null) {
+                            localLiked = !liked
+                            onLike?.invoke(!liked)
+                        }.padding(4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         CustomIcon(IconType.HEART, if (liked) Carrot else Muted, 17.dp, filled = liked)
@@ -3749,7 +3835,10 @@ private fun PostCard(
                         }
                     }
                     Spacer(Modifier.width(10.dp))
-                    Box(Modifier.clip(RoundedCornerShape(10.dp)).clickable(enabled = onBookmark != null) { bookmarked = !bookmarked; onBookmark?.invoke(bookmarked) }.padding(4.dp)) {
+                    Box(Modifier.clip(RoundedCornerShape(10.dp)).clickable(enabled = onBookmark != null) {
+                        localBookmarked = !bookmarked
+                        onBookmark?.invoke(!bookmarked)
+                    }.padding(4.dp)) {
                         CustomIcon(IconType.BOOKMARK, if (bookmarked) Carrot else Muted, 17.dp, filled = bookmarked)
                     }
                 }
@@ -4209,13 +4298,158 @@ private fun PostLinkPreviewCard(url: String) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MediaGallery(media: List<ApiMedia>) {
+    if (media.isEmpty()) return
+    val images = remember(media) {
+        media.filter {
+            val type = it.type.lowercase()
+            "video" !in type && "audio" !in type
+        }
+    }
+    var fullScreenImageIndex by remember(media) { mutableStateOf<Int?>(null) }
+    fullScreenImageIndex?.let { initialPage ->
+        FullScreenMediaGallery(
+            media = images,
+            initialPage = initialPage.coerceIn(0, images.lastIndex.coerceAtLeast(0)),
+            onDismiss = { fullScreenImageIndex = null }
+        )
+    }
     Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
         media.chunked(2).forEach { rowItems ->
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                rowItems.forEach { item -> Box(Modifier.weight(1f)) { MediaAttachment(item) } }
+                rowItems.forEach { item ->
+                    Box(Modifier.weight(1f)) {
+                        val imageIndex = images.indexOfFirst { it.url == item.url }
+                        MediaAttachment(
+                            media = item,
+                            onOpen = if (imageIndex >= 0) {
+                                { fullScreenImageIndex = imageIndex }
+                            } else null
+                        )
+                    }
+                }
                 if (rowItems.size == 1 && media.size > 1) Spacer(Modifier.weight(1f))
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun FullScreenMediaGallery(
+    media: List<ApiMedia>,
+    initialPage: Int,
+    onDismiss: () -> Unit
+) {
+    if (media.isEmpty()) return
+    val pagerState = rememberPagerState(
+        initialPage = initialPage,
+        pageCount = { media.size }
+    )
+    var zoomScale by remember { mutableStateOf(1f) }
+    var zoomOffset by remember { mutableStateOf(Offset.Zero) }
+    LaunchedEffect(pagerState.currentPage) {
+        zoomScale = 1f
+        zoomOffset = Offset.Zero
+    }
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
+    ) {
+        Box(Modifier.fillMaxSize().background(Color(0xF20A0B0D))) {
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.fillMaxSize(),
+                pageSpacing = 12.dp,
+                userScrollEnabled = zoomScale <= 1.01f,
+                verticalAlignment = Alignment.CenterVertically
+            ) { page ->
+                val item = media[page]
+                val isGif = "gif" in item.type.lowercase() ||
+                    item.url.substringBefore('?').lowercase().endsWith(".gif")
+                Box(
+                    Modifier.fillMaxSize().padding(horizontal = 10.dp, vertical = 58.dp)
+                        .graphicsLayer {
+                            scaleX = zoomScale
+                            scaleY = zoomScale
+                            translationX = zoomOffset.x
+                            translationY = zoomOffset.y
+                        }
+                        .pointerInput(item.url, pagerState.currentPage) {
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false)
+                                var transforming = zoomScale > 1.01f
+                                do {
+                                    val event = awaitPointerEvent()
+                                    val pressedCount = event.changes.count { it.pressed }
+                                    if (pressedCount >= 2 || transforming) {
+                                        val nextScale = (zoomScale * event.calculateZoom()).coerceIn(1f, 5f)
+                                        zoomScale = nextScale
+                                        zoomOffset = if (nextScale <= 1.01f) {
+                                            Offset.Zero
+                                        } else {
+                                            zoomOffset + event.calculatePan()
+                                        }
+                                        transforming = nextScale > 1.01f || pressedCount >= 2
+                                        event.changes.forEach { it.consume() }
+                                    }
+                                } while (event.changes.any { it.pressed })
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (isGif) {
+                        GifAttachment(
+                            media = item,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit
+                        )
+                    } else {
+                        AsyncImage(
+                            model = item.url,
+                            contentDescription = item.alt.ifBlank { "全画面画像" },
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit
+                        )
+                    }
+                }
+            }
+            if (media.size > 1) {
+                Box(
+                    Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 14.dp)
+                        .background(Color.Black.copy(.52f), RoundedCornerShape(18.dp))
+                        .padding(horizontal = 12.dp, vertical = 7.dp)
+                ) {
+                    KText(
+                        "${pagerState.currentPage + 1} / ${media.size}",
+                        11,
+                        Color.White,
+                        FontWeight.Bold
+                    )
+                }
+            }
+            Box(
+                Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 14.dp)
+                    .background(Color.Black.copy(.52f), RoundedCornerShape(18.dp))
+                    .padding(horizontal = 12.dp, vertical = 7.dp)
+            ) {
+                KText(
+                    if (zoomScale > 1.01f) "ピンチで縮小すると画像を切り替えられます" else "ピンチで拡大",
+                    10,
+                    Color.White.copy(alpha = .82f),
+                    FontWeight.Bold
+                )
+            }
+            Box(
+                Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(14.dp).size(42.dp)
+                    .background(Color.Black.copy(.55f), CircleShape)
+                    .border(1.dp, Color.White.copy(.25f), CircleShape)
+                    .clickable { onDismiss() },
+                contentAlignment = Alignment.Center
+            ) {
+                CustomIcon(IconType.CLOSE, Color.White, 22.dp)
             }
         }
     }
@@ -4251,11 +4485,152 @@ private fun rememberViewportPlayback(): ViewportPlayback {
     return ViewportPlayback(resumed && inViewport, positionModifier)
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun MediaAttachment(media: ApiMedia, compact: Boolean = false) {
+private fun MediaAttachment(
+    media: ApiMedia,
+    compact: Boolean = false,
+    onOpen: (() -> Unit)? = null
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val kind = media.type.lowercase()
     val isGif = "gif" in kind || media.url.substringBefore('?').lowercase().endsWith(".gif")
     var fullScreen by remember(media.url) { mutableStateOf(false) }
+    var imageMenuOpen by remember(media.url) { mutableStateOf(false) }
+    var spoilerRevealed by remember(media.url, media.spoiler) { mutableStateOf(!media.spoiler) }
+    val isImage = "video" !in kind && "audio" !in kind
+    val saveMimeType = media.type.takeIf { it.startsWith("image/", ignoreCase = true) } ?: "image/*"
+    val saveFileName = remember(media.url, saveMimeType) {
+        val fallbackExtension = when {
+            "gif" in saveMimeType -> "gif"
+            "png" in saveMimeType -> "png"
+            "webp" in saveMimeType -> "webp"
+            else -> "jpg"
+        }
+        Uri.parse(media.url).lastPathSegment
+            ?.substringBefore('?')
+            ?.takeIf { it.isNotBlank() }
+            ?.replace(Regex("[^A-Za-z0-9._-]"), "_")
+            ?: "Karoha-image-${System.currentTimeMillis()}.$fallbackExtension"
+    }
+    val saveImageLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument(saveMimeType)
+    ) { destination ->
+        if (destination != null) {
+            scope.launch {
+                val saved = withContext(Dispatchers.IO) {
+                    runCatching {
+                        URL(media.url).openConnection().apply {
+                            connectTimeout = 15_000
+                            readTimeout = 30_000
+                            setRequestProperty("User-Agent", "Karoha")
+                        }.getInputStream().use { input ->
+                            context.contentResolver.openOutputStream(destination)?.use { output ->
+                                input.copyTo(output)
+                            } ?: error("Cannot open destination")
+                        }
+                    }.isSuccess
+                }
+                Toast.makeText(
+                    context,
+                    if (saved) "画像を保存しました" else "画像を保存できませんでした",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+    val imageInteractionModifier = Modifier.combinedClickable(
+        onClick = { onOpen?.invoke() ?: run { fullScreen = true } },
+        onLongClick = { imageMenuOpen = true }
+    )
+    if (imageMenuOpen) {
+        val systemNavigationClearance =
+            WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding() + 28.dp
+        Dialog(
+            onDismissRequest = { imageMenuOpen = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+                Box(Modifier.fillMaxSize().clickable { imageMenuOpen = false })
+                AnimatedVisibility(
+                    visible = imageMenuOpen,
+                    enter = slideInVertically(tween(280, easing = FastOutSlowInEasing)) { it } + fadeIn(tween(160)),
+                    exit = slideOutVertically(tween(210, easing = FastOutSlowInEasing)) { it } + fadeOut(tween(140))
+                ) {
+                    Column(
+                        Modifier.fillMaxWidth()
+                            .clip(RoundedCornerShape(topStart = 27.dp, topEnd = 27.dp))
+                            .background(Surface)
+                            .border(
+                                1.dp,
+                                Hairline,
+                                RoundedCornerShape(topStart = 27.dp, topEnd = 27.dp)
+                            )
+                            .clickable { }
+                            .padding(
+                                start = 18.dp,
+                                top = 10.dp,
+                                end = 18.dp,
+                                bottom = systemNavigationClearance
+                            )
+                    ) {
+                        Box(
+                            Modifier.width(38.dp).height(4.dp)
+                                .background(Hairline, RoundedCornerShape(3.dp))
+                                .align(Alignment.CenterHorizontally)
+                        )
+                        Spacer(Modifier.height(14.dp))
+                        KText("画像", 16, Ink, FontWeight.Black)
+                        KText("画像に対する操作を選択", 10, Muted, FontWeight.Medium)
+                        Spacer(Modifier.height(14.dp))
+                        Row(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(15.dp))
+                                .clickable {
+                                    imageMenuOpen = false
+                                    onOpen?.invoke() ?: run { fullScreen = true }
+                                }
+                                .padding(horizontal = 10.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                Modifier.size(40.dp).background(Paper, RoundedCornerShape(13.dp)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                CustomIcon(IconType.EYE, Ink, 19.dp)
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column {
+                                KText("全画面で表示", 13, Ink, FontWeight.Bold)
+                                KText("画像を拡大して表示します", 9, Muted)
+                            }
+                        }
+                        Row(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(15.dp))
+                                .clickable {
+                                    imageMenuOpen = false
+                                    saveImageLauncher.launch(saveFileName)
+                                }
+                                .padding(horizontal = 10.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                Modifier.size(40.dp).background(PaleCarrot, RoundedCornerShape(13.dp)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                CustomIcon(IconType.IMAGE, Carrot, 19.dp)
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column {
+                                KText("画像を保存", 13, Ink, FontWeight.Bold)
+                                KText("端末内の保存先を選択します", 9, Muted)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (fullScreen && "video" !in kind && "audio" !in kind) {
         var zoomScale by remember(media.url) { mutableStateOf(1f) }
         var zoomOffset by remember(media.url) { mutableStateOf(Offset.Zero) }
@@ -4302,19 +4677,42 @@ private fun MediaAttachment(media: ApiMedia, compact: Boolean = false) {
             }
         }
     }
+    if (!spoilerRevealed && isImage) {
+        Box(
+            Modifier.fillMaxWidth().height(if (compact) 110.dp else 180.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(Strong)
+                .clickable { spoilerRevealed = true },
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Box(
+                    Modifier.size(38.dp).background(OnStrong.copy(alpha = .12f), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CustomIcon(IconType.EYE, OnStrong, 19.dp)
+                }
+                Spacer(Modifier.height(9.dp))
+                KText("センシティブなメディア", 11, OnStrong, FontWeight.Black, letterSpacing = .6f)
+                Spacer(Modifier.height(3.dp))
+                KText("タップして表示", 9, OnStrong.copy(alpha = .7f), FontWeight.Bold)
+            }
+        }
+        return
+    }
     when {
         "video" in kind -> VideoAttachment(media, compact)
         "audio" in kind -> AudioAttachment(media)
         isGif -> GifAttachment(
             media = media,
             modifier = Modifier.fillMaxWidth().height(if (compact) 110.dp else 180.dp)
-                .clip(RoundedCornerShape(16.dp)).background(Hairline).clickable { fullScreen = true },
+                .clip(RoundedCornerShape(16.dp)).background(Hairline).then(imageInteractionModifier),
             contentScale = ContentScale.Crop
         )
         else -> AsyncImage(
             media.url,
             media.alt.ifBlank { "投稿画像" },
-            Modifier.fillMaxWidth().height(if (compact) 110.dp else 180.dp).clip(RoundedCornerShape(16.dp)).background(Hairline).clickable { fullScreen = true },
+            Modifier.fillMaxWidth().height(if (compact) 110.dp else 180.dp).clip(RoundedCornerShape(16.dp)).background(Hairline).then(imageInteractionModifier),
             contentScale = ContentScale.Crop
         )
     }
@@ -11518,7 +11916,10 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
     var following by remember(user.id, user.isFollowing) { mutableStateOf(user.isFollowing) }
     var followRequestSent by remember(user.id, user.followRequestSent) { mutableStateOf(user.followRequestSent) }
     val privateProfileLocked = !isOwn && user.isPrivate && !following
-    val profileContentLocked = privateProfileLocked || user.isBanned
+    val ageRestrictedProfile = !isOwn &&
+        user.profileUnavailableReason.equals("FILTERED", ignoreCase = true) &&
+        user.profileUnavailableDetails.any { it.equals("MINOR_RESTRICTED", ignoreCase = true) }
+    val profileContentLocked = privateProfileLocked || user.isBanned || ageRestrictedProfile
     val profileTabs = buildList {
         add("投稿" to "posts")
         add("返信" to "replies")
@@ -11675,7 +12076,7 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
         ProfileConnectionsScreen(
             profileUser = user,
             kind = kind,
-            locked = privateProfileLocked,
+            locked = profileContentLocked,
             showMutualFollowers = !isOwn,
             api = api,
             onBack = { connectionKind = null },
@@ -12065,6 +12466,25 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
                         KText("このアカウントはBANされています", 11, Color(0xFFD64045), FontWeight.Black, maxLines = 1)
                     }
                 }
+                if (ageRestrictedProfile) {
+                    Spacer(Modifier.height(10.dp))
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .background(Color(0xFFF08A24).copy(.12f), RoundedCornerShape(13.dp))
+                            .border(1.dp, Color(0xFFF08A24).copy(.42f), RoundedCornerShape(13.dp))
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        CustomIcon(IconType.LOCK, Color(0xFFE27612), 17.dp)
+                        Spacer(Modifier.width(8.dp))
+                        KText(
+                            "年齢制限により投稿を表示できません",
+                            11,
+                            Color(0xFFE27612),
+                            FontWeight.Black
+                        )
+                    }
+                }
                 if (!isOwn && user.id != viewerUserId) {
                     (safetyError ?: notificationError)?.let {
                         Spacer(Modifier.height(7.dp))
@@ -12114,13 +12534,13 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
                     Stat(
                         user.followingCount.toString(),
                         "フォロー",
-                        if (privateProfileLocked) null else ({ connectionKind = "following" })
+                        if (profileContentLocked) null else ({ connectionKind = "following" })
                     )
                     Spacer(Modifier.width(26.dp))
                     Stat(
                         visibleFollowers.toString(),
                         "フォロワー",
-                        if (privateProfileLocked) null else ({ connectionKind = "followers" })
+                        if (profileContentLocked) null else ({ connectionKind = "followers" })
                     )
                     Spacer(Modifier.width(26.dp))
                     Stat(user.postsCount.toString(), "投稿")
@@ -12146,15 +12566,20 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
         }
         if (profileContentLocked) {
             item(key = "profile-restricted-notice-$selectedKind") {
+                val restrictionColor = when {
+                    user.isBanned -> Color(0xFFD64045)
+                    ageRestrictedProfile -> Color(0xFFE27612)
+                    else -> Carrot
+                }
                 Column(
                     Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 36.dp)
                         .background(
-                            if (user.isBanned) Color(0xFFD64045).copy(.08f) else Surface,
+                            if (user.isBanned || ageRestrictedProfile) restrictionColor.copy(.08f) else Surface,
                             RoundedCornerShape(22.dp)
                         )
                         .border(
                             1.dp,
-                            if (user.isBanned) Color(0xFFD64045).copy(.38f) else Hairline,
+                            if (user.isBanned || ageRestrictedProfile) restrictionColor.copy(.38f) else Hairline,
                             RoundedCornerShape(22.dp)
                         )
                         .padding(horizontal = 22.dp, vertical = 28.dp),
@@ -12162,30 +12587,37 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
                 ) {
                     Box(
                         Modifier.size(48.dp).background(
-                            if (user.isBanned) Color(0xFFD64045).copy(.14f) else PaleCarrot,
+                            if (user.isBanned || ageRestrictedProfile) restrictionColor.copy(.14f) else PaleCarrot,
                             RoundedCornerShape(16.dp)
                         ),
                         contentAlignment = Alignment.Center
                     ) {
                         CustomIcon(
                             if (user.isBanned) IconType.BLOCK else IconType.LOCK,
-                            if (user.isBanned) Color(0xFFD64045) else Carrot,
+                            restrictionColor,
                             22.dp
                         )
                     }
                     Spacer(Modifier.height(14.dp))
                     KText(
-                        if (user.isBanned) "このアカウントはBANされています" else "このアカウントは非公開です",
+                        when {
+                            user.isBanned -> "このアカウントはBANされています"
+                            ageRestrictedProfile -> "年齢制限のあるプロフィールです"
+                            else -> "このアカウントは非公開です"
+                        },
                         15,
-                        if (user.isBanned) Color(0xFFD64045) else Ink,
+                        if (user.isBanned || ageRestrictedProfile) restrictionColor else Ink,
                         FontWeight.Black
                     )
                     Spacer(Modifier.height(7.dp))
                     KText(
-                        if (user.isBanned) {
-                            "このアカウントは利用を制限されているため、\n投稿やアクティビティを表示できません。"
-                        } else {
-                            "投稿、返信、メディア、いいねを見るには\nフォローリクエストを送信してください。"
+                        when {
+                            user.isBanned ->
+                                "このアカウントは利用を制限されているため、\n投稿やアクティビティを表示できません。"
+                            ageRestrictedProfile ->
+                                "相手が設定した年齢条件を満たしていないため、\n投稿、返信、メディア、いいねを表示できません。"
+                            else ->
+                                "投稿、返信、メディア、いいねを見るには\nフォローリクエストを送信してください。"
                         },
                         11,
                         Muted,
@@ -14030,6 +14462,8 @@ private val InlineLatexPattern = Regex("\\\\\\((.+?)\\\\\\)")
 private val BlockLatexPattern = Regex("\\\\\\[([\\s\\S]+?)\\\\]")
 private val ProtectedMarkdownPattern = Regex("(?s)(```.*?```|`[^`\\n]*`|\\$\\$.*?\\$\\$)")
 private val ProtectedMarkdownTokenPattern = Regex("\\uE000(\\d+)\\uE001")
+private val QuotedRubyPattern = Regex("\"([^\"\\n]{1,60})\"《([^《》\\n]{1,80})》")
+private val BarRubyPattern = Regex("[|｜]([^《\\n]{1,60})《([^《》\\n]{1,80})》")
 
 private fun richMarkdown(source: String): String {
     var value = source.take(20_000)
@@ -14057,6 +14491,86 @@ private fun richMarkdown(source: String): String {
     }
     return ProtectedMarkdownTokenPattern.replace(value) { match ->
         protected.getOrNull(match.groupValues[1].toIntOrNull() ?: -1).orEmpty()
+    }
+}
+
+private fun applyRubySpans(view: TextView, textColor: Int, textSizePx: Float) {
+    val source = view.text.toString()
+    val matches = (QuotedRubyPattern.findAll(source) + BarRubyPattern.findAll(source))
+        .distinctBy { it.range }
+        .sortedByDescending { it.range.first }
+        .toList()
+    if (matches.isEmpty()) return
+    val builder = SpannableStringBuilder(view.text)
+    matches.forEach { match ->
+        val base = match.groupValues[1]
+        val ruby = match.groupValues[2]
+        val start = match.range.first
+        val endExclusive = match.range.last + 1
+        builder.replace(start, endExclusive, base)
+        builder.setSpan(
+            RubySpan(ruby, textSizePx * .48f, textColor),
+            start,
+            start + base.length,
+            Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+        )
+    }
+    view.text = builder
+}
+
+private class RubySpan(
+    private val ruby: String,
+    private val rubyTextSize: Float,
+    private val rubyColor: Int
+) : ReplacementSpan() {
+    private fun rubyPaint(base: Paint): Paint = Paint(base).apply {
+        textSize = rubyTextSize
+        color = rubyColor
+        isFakeBoldText = false
+    }
+
+    override fun getSize(
+        paint: Paint,
+        text: CharSequence,
+        start: Int,
+        end: Int,
+        fm: Paint.FontMetricsInt?
+    ): Int {
+        val rubyPaint = rubyPaint(paint)
+        val width = maxOf(
+            paint.measureText(text, start, end),
+            rubyPaint.measureText(ruby)
+        )
+        fm?.let {
+            val baseMetrics = paint.fontMetricsInt
+            val rubyMetrics = rubyPaint.fontMetricsInt
+            val rubyHeight = rubyMetrics.descent - rubyMetrics.ascent
+            it.ascent = baseMetrics.ascent - rubyHeight - 2
+            it.top = minOf(baseMetrics.top, it.ascent)
+            it.descent = baseMetrics.descent
+            it.bottom = baseMetrics.bottom
+            it.leading = baseMetrics.leading
+        }
+        return width.toInt().coerceAtLeast(1)
+    }
+
+    override fun draw(
+        canvas: android.graphics.Canvas,
+        text: CharSequence,
+        start: Int,
+        end: Int,
+        x: Float,
+        top: Int,
+        y: Int,
+        bottom: Int,
+        paint: Paint
+    ) {
+        val rubyPaint = rubyPaint(paint)
+        val baseWidth = paint.measureText(text, start, end)
+        val rubyWidth = rubyPaint.measureText(ruby)
+        val boxWidth = maxOf(baseWidth, rubyWidth)
+        canvas.drawText(ruby, x + (boxWidth - rubyWidth) / 2f, y + paint.ascent() - rubyPaint.descent() - 1f, rubyPaint)
+        canvas.drawText(text, start, end, x + (boxWidth - baseWidth) / 2f, y.toFloat(), paint)
     }
 }
 
@@ -14115,7 +14629,10 @@ private fun RichContentText(
             view.setLineSpacing(lineExtra, 1f)
             view.maxLines = maxLines
             view.ellipsize = if (maxLines == Int.MAX_VALUE) null else TextUtils.TruncateAt.END
-            runCatching { markwon.setMarkdown(view, richMarkdown(text)) }
+            runCatching {
+                markwon.setMarkdown(view, richMarkdown(text))
+                applyRubySpans(view, color.toArgb(), textPx)
+            }
                 .onFailure { view.text = text.take(20_000) }
             if (onPlainTextClick != null) {
                 val current = view.movementMethod

@@ -41,7 +41,10 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         AppVisibility.isForeground = true
-        stopService(Intent(this, BackgroundNotificationService::class.java))
+        // Do not stop a service that may have just been launched with
+        // startForegroundService(). Its onCreate() must get a chance to call
+        // startForeground(), otherwise Android terminates the app. The service
+        // observes AppVisibility and stops itself without polling.
     }
 
     override fun onPause() {

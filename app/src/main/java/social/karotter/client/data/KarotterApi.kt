@@ -64,10 +64,20 @@ data class ApiUser(
     val isPostNotificationsEnabled: Boolean = false,
     val isBanned: Boolean = false,
     val pinnedPostLimit: Int = 1,
-    val questionsEnabled: Boolean = false
+    val questionsEnabled: Boolean = false,
+    val profileMinimumAge: Int? = null,
+    val profileMaximumAge: Int? = null,
+    val hideProfileFromMinors: Boolean = false,
+    val profileUnavailableReason: String? = null,
+    val profileUnavailableDetails: List<String> = emptyList()
 )
 
-data class ApiMedia(val url: String, val type: String, val alt: String)
+data class ApiMedia(
+    val url: String,
+    val type: String,
+    val alt: String,
+    val spoiler: Boolean = false
+)
 data class ApiReaction(val emoji: String, val count: Int, val reacted: Boolean)
 data class ApiPollOption(
     val id: Long,
@@ -120,7 +130,8 @@ data class ApiPost(
     val viewsCount: Int = 0,
     val bookmarksCount: Int = 0,
     val quoteUsersCount: Int = 0,
-    val parentId: Long? = null
+    val parentId: Long? = null,
+    val canQuote: Boolean = true
 )
 
 data class ApiStory(
@@ -536,6 +547,15 @@ class KarotterApi(context: Context) {
         if (!source.has("isBlockedBy")) source.put("isBlockedBy", root.optBoolean("isBlockedBy"))
         if (!source.has("isPostNotificationsEnabled")) {
             source.put("isPostNotificationsEnabled", root.optBoolean("isPostNotificationsEnabled"))
+        }
+        listOf(
+            "profileMinimumAge",
+            "profileMaximumAge",
+            "hideProfileFromMinors",
+            "profileUnavailableReason",
+            "profileUnavailableDetails"
+        ).forEach { key ->
+            if (!source.has(key) && root.has(key)) source.put(key, root.opt(key))
         }
         parseUser(source)
     }
@@ -2117,6 +2137,7 @@ class KarotterApi(context: Context) {
         val mediaUrls = json.optJSONArray("mediaUrls")
         val mediaTypes = json.optJSONArray("mediaTypes")
         val mediaAlts = json.optJSONArray("mediaAlts")
+        val mediaSpoilerFlags = json.optJSONArray("mediaSpoilerFlags")
         val media = buildList {
             if (mediaUrls != null) for (i in 0 until mediaUrls.length()) {
                 val url = absolute(mediaUrls.optString(i)) ?: continue
@@ -2127,7 +2148,14 @@ class KarotterApi(context: Context) {
                     "mp3", "m4a", "aac", "wav", "ogg", "flac" -> "audio"
                     else -> "image"
                 }
-                add(ApiMedia(url, declared.ifBlank { inferred }, mediaAlts?.optString(i).orEmpty()))
+                add(
+                    ApiMedia(
+                        url,
+                        declared.ifBlank { inferred },
+                        mediaAlts?.optString(i).orEmpty(),
+                        mediaSpoilerFlags?.optBoolean(i) == true
+                    )
+                )
             }
         }
         val content = sequenceOf("content", "text", "body", "caption")
@@ -2171,7 +2199,13 @@ class KarotterApi(context: Context) {
             viewsCount = json.optInt("viewsCount"),
             bookmarksCount = json.optInt("bookmarksCount", json.optJSONObject("_count")?.optInt("bookmarks") ?: 0),
             quoteUsersCount = json.optInt("quoteUsersCount"),
-            parentId = json.optNullableLong("parentId")
+            parentId = json.optNullableLong("parentId"),
+            canQuote = json.optBoolean(
+                "canQuote",
+                !json.optJSONObject("author")
+                    ?.optBoolean("isPrivate", false)
+                    .orFalse()
+            )
         )
     }
 
@@ -2426,6 +2460,12 @@ class KarotterApi(context: Context) {
             val array = json.optJSONArray("subscriptionBadgeColors") ?: JSONArray()
             for (index in 0 until array.length()) array.optString(index).takeIf(String::isNotBlank)?.let(::add)
         }
+        val profileUnavailableDetails = buildList {
+            val array = json.optJSONArray("profileUnavailableDetails") ?: JSONArray()
+            for (index in 0 until array.length()) {
+                array.optString(index).takeIf(String::isNotBlank)?.let(::add)
+            }
+        }
         return ApiUser(
             json.optLong("id"), json.optString("username"), json.optString("displayName", json.optString("username", "Karotter user")),
             absolute(json.optString("avatarUrl")), absolute(json.optString("headerUrl")), json.optString("bio"), absolute(json.optString("websiteUrl")), json.optBoolean("showLikedPosts", false),
@@ -2476,9 +2516,16 @@ class KarotterApi(context: Context) {
                     else -> 1
                 }
             ).coerceAtLeast(1),
-            json.optBoolean("questionsEnabled")
+            json.optBoolean("questionsEnabled"),
+            json.optNullableInt("profileMinimumAge"),
+            json.optNullableInt("profileMaximumAge"),
+            json.optBoolean("hideProfileFromMinors"),
+            json.optString("profileUnavailableReason").takeIf { it.isNotBlank() && it != "null" },
+            profileUnavailableDetails
         )
     }
+
+    private fun Boolean?.orFalse(): Boolean = this == true
 
     private fun mergeLevelData(user: JSONObject, envelope: JSONObject) {
         if (user === envelope) return
