@@ -263,6 +263,12 @@ sealed interface ApiResult<out T> {
     data class Failure(val message: String, val status: Int? = null) : ApiResult<Nothing>
 }
 
+sealed interface ApiLoginResult {
+    data class Success(val user: ApiUser) : ApiLoginResult
+    data class TwoFactorRequired(val token: String) : ApiLoginResult
+    data class Failure(val message: String, val status: Int? = null) : ApiLoginResult
+}
+
 class SessionStore(context: Context) {
     private val prefs = context.getSharedPreferences("karotter_session_v1", Context.MODE_PRIVATE)
     val deviceId: String
@@ -330,7 +336,11 @@ class KarotterApi(context: Context) {
 
     fun hasNetworkConnection(): Boolean = appContext.hasValidatedInternet()
 
-    fun login(identifier: String, password: String, rememberCredentials: Boolean = true): ApiResult<ApiUser> {
+    fun beginLogin(
+        identifier: String,
+        password: String,
+        rememberCredentials: Boolean = true
+    ): ApiLoginResult {
         val body = JSONObject()
             .put("identifier", identifier)
             .put("password", password)
@@ -339,25 +349,102 @@ class KarotterApi(context: Context) {
             .put("clientType", "android")
             .put("deviceName", CLIENT_DEVICE_NAME)
         return when (val result = request("auth/login", "POST", body.toString(), authenticated = false, retryAuth = false)) {
-            is ApiResult.Failure -> ApiResult.Failure(
+            is ApiResult.Failure -> ApiLoginResult.Failure(
                 buildString {
                     append(result.message.ifBlank { "ログインできませんでした" })
                     result.status?.let { append("（HTTP $it）") }
                 },
                 result.status
             )
-            is ApiResult.Success -> try {
+            is ApiResult.Success -> {
                 val json = result.value
-                session.accessToken = json.optString("accessToken").takeIf { it.isNotBlank() }
-                session.sessionId = json.optString("sessionId").takeIf { it.isNotBlank() }
-                val loggedInUser = parseUser(json.getJSONObject("user"))
-                if (rememberCredentials) {
-                    credentials.save(identifier, password)
-                    credentials.saveSessionIdForActive(session.sessionId)
-                    credentials.saveProfileForActive(loggedInUser.displayName, loggedInUser.username, loggedInUser.avatarUrl)
+                if (json.optBoolean("twoFactorRequired")) {
+                    val token = json.optString("twoFactorToken").trim()
+                    if (token.isBlank()) {
+                        ApiLoginResult.Failure("二段階認証を開始できませんでした")
+                    } else {
+                        ApiLoginResult.TwoFactorRequired(token)
+                    }
+                } else {
+                    finishLogin(json, identifier, password, rememberCredentials)
                 }
-                ApiResult.Success(loggedInUser)
-            } catch (_: Exception) { ApiResult.Failure("ログイン応答を読み取れませんでした") }
+            }
+        }
+    }
+
+    fun completeTwoFactorLogin(
+        identifier: String,
+        password: String,
+        twoFactorToken: String,
+        code: String,
+        rememberCredentials: Boolean = true
+    ): ApiLoginResult {
+        val normalizedCode = code.trim()
+        if (!normalizedCode.matches(Regex("\\d{6}"))) {
+            return ApiLoginResult.Failure("6桁の認証コードを入力してください")
+        }
+        val body = JSONObject()
+            .put("twoFactorToken", twoFactorToken)
+            .put("code", normalizedCode)
+            .put("deviceId", session.deviceId)
+            .put("clientType", "android")
+            .put("deviceName", CLIENT_DEVICE_NAME)
+        return when (
+            val result = request(
+                "auth/login/2fa",
+                "POST",
+                body.toString(),
+                authenticated = false,
+                retryAuth = false
+            )
+        ) {
+            is ApiResult.Failure -> ApiLoginResult.Failure(
+                when (result.status) {
+                    400, 401 -> "認証コードが正しくありません"
+                    else -> result.message.ifBlank { "二段階認証に失敗しました" }
+                },
+                result.status
+            )
+            is ApiResult.Success -> finishLogin(
+                result.value,
+                identifier,
+                password,
+                rememberCredentials
+            )
+        }
+    }
+
+    fun login(identifier: String, password: String, rememberCredentials: Boolean = true): ApiResult<ApiUser> {
+        return when (val result = beginLogin(identifier, password, rememberCredentials)) {
+            is ApiLoginResult.Success -> ApiResult.Success(result.user)
+            is ApiLoginResult.TwoFactorRequired ->
+                ApiResult.Failure("二段階認証コードの入力が必要です", 401)
+            is ApiLoginResult.Failure -> ApiResult.Failure(result.message, result.status)
+        }
+    }
+
+    private fun finishLogin(
+        json: JSONObject,
+        identifier: String,
+        password: String,
+        rememberCredentials: Boolean
+    ): ApiLoginResult {
+        return try {
+            session.accessToken = json.optString("accessToken").takeIf { it.isNotBlank() }
+            session.sessionId = json.optString("sessionId").takeIf { it.isNotBlank() }
+            val loggedInUser = parseUser(json.getJSONObject("user"))
+            if (rememberCredentials) {
+                credentials.save(identifier, password)
+                credentials.saveSessionIdForActive(session.sessionId)
+                credentials.saveProfileForActive(
+                    loggedInUser.displayName,
+                    loggedInUser.username,
+                    loggedInUser.avatarUrl
+                )
+            }
+            ApiLoginResult.Success(loggedInUser)
+        } catch (_: Exception) {
+            ApiLoginResult.Failure("ログイン応答を読み取れませんでした")
         }
     }
 

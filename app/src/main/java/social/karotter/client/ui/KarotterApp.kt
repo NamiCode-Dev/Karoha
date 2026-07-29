@@ -104,6 +104,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
@@ -246,6 +247,7 @@ import social.karotter.client.data.ApiFollowRequest
 import social.karotter.client.data.ApiMedia
 import social.karotter.client.data.ApiLevelRankingEntry
 import social.karotter.client.data.ApiLinkPreview
+import social.karotter.client.data.ApiLoginResult
 import social.karotter.client.data.ApiNotification
 import social.karotter.client.data.ApiPost
 import social.karotter.client.data.ApiPoll
@@ -787,13 +789,26 @@ fun KarotterApp(
             },
             onLogin = { identifier, password, done ->
                 scope.launch {
-                    val result = withContext(Dispatchers.IO) { api.login(identifier, password) }
-                    if (result is ApiResult.Success) {
-                        user = result.value
+                    val result = withContext(Dispatchers.IO) { api.beginLogin(identifier, password) }
+                    if (result is ApiLoginResult.Success) {
+                        user = result.user
                         returnAccountIdentifier = null
                         BackgroundNotificationManager.onLoginSucceeded(context)
                     }
-                    done((result as? ApiResult.Failure)?.message)
+                    done(result)
+                }
+            },
+            onVerifyTwoFactor = { identifier, password, token, code, done ->
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        api.completeTwoFactorLogin(identifier, password, token, code)
+                    }
+                    if (result is ApiLoginResult.Success) {
+                        user = result.user
+                        returnAccountIdentifier = null
+                        BackgroundNotificationManager.onLoginSucceeded(context)
+                    }
+                    done(result)
                 }
             }
         )
@@ -2587,13 +2602,33 @@ private fun DataFailureRecoveryScreen(
 }
 
 @Composable
-private fun LoginScreen(onBack: (() -> Unit)? = null, onLogin: (String, String, (String?) -> Unit) -> Unit) {
+private fun LoginScreen(
+    onBack: (() -> Unit)? = null,
+    onLogin: (String, String, (ApiLoginResult) -> Unit) -> Unit,
+    onVerifyTwoFactor: (String, String, String, String, (ApiLoginResult) -> Unit) -> Unit
+) {
     var identifier by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    var twoFactorToken by remember { mutableStateOf<String?>(null) }
+    var twoFactorCode by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    val enabled = identifier.isNotBlank() && password.isNotBlank() && !busy
-    BackHandler(enabled = onBack != null && !busy) { onBack?.invoke() }
+    val awaitingTwoFactor = twoFactorToken != null
+    val enabled = if (awaitingTwoFactor) {
+        twoFactorCode.length == 6 && !busy
+    } else {
+        identifier.isNotBlank() && password.isNotBlank() && !busy
+    }
+    val goBack = {
+        if (awaitingTwoFactor) {
+            twoFactorToken = null
+            twoFactorCode = ""
+            error = null
+        } else {
+            onBack?.invoke()
+        }
+    }
+    BackHandler(enabled = !busy && (awaitingTwoFactor || onBack != null)) { goBack() }
 
     Box(Modifier.fillMaxSize().background(Paper)) {
         Canvas(Modifier.fillMaxWidth().height(145.dp)) {
@@ -2601,26 +2636,68 @@ private fun LoginScreen(onBack: (() -> Unit)? = null, onLogin: (String, String, 
             drawCircle(Carrot, size.width * .34f, Offset(size.width * .94f, size.height * .04f))
             drawCircle(OnStrong.copy(alpha = .1f), size.width * .14f, Offset(size.width * .12f, size.height * .82f))
         }
-        KText("K", 28, OnStrong, FontWeight.Black, modifier = Modifier.padding(start = if (onBack != null) 82.dp else 26.dp, top = 43.dp))
-        if (onBack != null) {
+        KText(
+            "K",
+            28,
+            OnStrong,
+            FontWeight.Black,
+            modifier = Modifier.padding(
+                start = if (awaitingTwoFactor || onBack != null) 82.dp else 26.dp,
+                top = 43.dp
+            )
+        )
+        if (awaitingTwoFactor || onBack != null) {
             Box(
                 Modifier.zIndex(3f).padding(start = 22.dp, top = 37.dp).size(42.dp).background(Color.White.copy(.14f), CircleShape)
-                    .border(1.dp, Color.White.copy(.25f), CircleShape).clickable(enabled = !busy) { onBack() },
+                    .border(1.dp, Color.White.copy(.25f), CircleShape).clickable(enabled = !busy) { goBack() },
                 contentAlignment = Alignment.Center
             ) { CustomIcon(IconType.BACK, Color.White, 20.dp) }
         }
         LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(horizontal = 26.dp, vertical = 32.dp)) {
             item {
                 Spacer(Modifier.height(136.dp))
-                KText("KAROHA", 11, Carrot, FontWeight.Black, letterSpacing = 3f)
+                KText(if (awaitingTwoFactor) "KAROHA SECURITY" else "KAROHA", 11, Carrot, FontWeight.Black, letterSpacing = 3f)
                 Spacer(Modifier.height(13.dp))
-                KText("おかえり。\n話の続きをしよう。", 32, Ink, FontWeight.Black, lineHeight = 40f)
+                KText(
+                    if (awaitingTwoFactor) "本人確認を\n完了しよう。" else "おかえり。\n話の続きをしよう。",
+                    32,
+                    Ink,
+                    FontWeight.Black,
+                    lineHeight = 40f
+                )
                 Spacer(Modifier.height(11.dp))
-                KText("Karotterのアカウントでログイン", 12, Muted)
+                KText(
+                    if (awaitingTwoFactor) {
+                        "認証アプリに表示されている6桁のコードを入力してください。"
+                    } else {
+                        "Karotterのアカウントでログイン"
+                    },
+                    12,
+                    Muted,
+                    lineHeight = 18f
+                )
                 Spacer(Modifier.height(34.dp))
-                LoginField("ユーザー名 または メール", identifier, { identifier = it }, false)
-                Spacer(Modifier.height(12.dp))
-                LoginField("パスワード", password, { password = it }, true)
+                if (awaitingTwoFactor) {
+                    LoginField(
+                        "000000",
+                        twoFactorCode,
+                        { twoFactorCode = it.filter(Char::isDigit).take(6) },
+                        password = false,
+                        keyboardType = KeyboardType.Number
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    KText(
+                        "コードは端末に保存されません。",
+                        9,
+                        Muted,
+                        FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 3.dp)
+                    )
+                } else {
+                    LoginField("ユーザー名 または メール", identifier, { identifier = it }, false)
+                    Spacer(Modifier.height(12.dp))
+                    LoginField("パスワード", password, { password = it }, true)
+                }
                 AnimatedVisibility(error != null, enter = expandVertically() + fadeIn(), exit = fadeOut()) {
                     KText(error.orEmpty(), 11, Carrot, FontWeight.Bold, modifier = Modifier.padding(top = 12.dp))
                 }
@@ -2628,31 +2705,81 @@ private fun LoginScreen(onBack: (() -> Unit)? = null, onLogin: (String, String, 
                 Box(
                     Modifier.fillMaxWidth().height(54.dp).background(if (enabled) Strong else Hairline, RoundedCornerShape(18.dp))
                         .clickable(enabled = enabled) {
-                            busy = true; error = null
-                            onLogin(identifier.trim(), password) { message -> busy = false; error = message }
+                            busy = true
+                            error = null
+                            val handleResult: (ApiLoginResult) -> Unit = { result ->
+                                busy = false
+                                when (result) {
+                                    is ApiLoginResult.Success -> Unit
+                                    is ApiLoginResult.TwoFactorRequired -> {
+                                        twoFactorToken = result.token
+                                        twoFactorCode = ""
+                                    }
+                                    is ApiLoginResult.Failure -> error = result.message
+                                }
+                            }
+                            if (awaitingTwoFactor) {
+                                onVerifyTwoFactor(
+                                    identifier.trim(),
+                                    password,
+                                    twoFactorToken.orEmpty(),
+                                    twoFactorCode,
+                                    handleResult
+                                )
+                            } else {
+                                onLogin(identifier.trim(), password, handleResult)
+                            }
                         },
                     contentAlignment = Alignment.Center
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                        KText(if (busy) "接続しています…" else "ログイン", 13, if (enabled) OnStrong else Muted, FontWeight.Bold)
+                        KText(
+                            when {
+                                busy -> if (awaitingTwoFactor) "確認しています…" else "接続しています…"
+                                awaitingTwoFactor -> "認証してログイン"
+                                else -> "ログイン"
+                            },
+                            13,
+                            if (enabled) OnStrong else Muted,
+                            FontWeight.Bold
+                        )
                         if (!busy) CustomIcon(IconType.FORWARD, if (enabled) OnStrong else Muted, 15.dp)
                     }
                 }
                 Spacer(Modifier.height(16.dp))
                 Spacer(Modifier.height(16.dp))
-                KText("ログイン情報はAndroid Keystoreで暗号化し、このアプリ専用領域に安全に保存します。", 10, Muted, lineHeight = 16f)
+                KText(
+                    if (awaitingTwoFactor) {
+                        "認証コードを他人に共有しないでください。"
+                    } else {
+                        "ログイン情報はAndroid Keystoreで暗号化し、このアプリ専用領域に安全に保存します。"
+                    },
+                    10,
+                    Muted,
+                    lineHeight = 16f
+                )
             }
         }
     }
 }
 
 @Composable
-private fun LoginField(label: String, value: String, onChange: (String) -> Unit, password: Boolean) {
+private fun LoginField(
+    label: String,
+    value: String,
+    onChange: (String) -> Unit,
+    password: Boolean,
+    keyboardType: KeyboardType = if (password) KeyboardType.Password else KeyboardType.Text
+) {
     BasicTextField(
         value = value,
         onValueChange = onChange,
         singleLine = true,
         visualTransformation = if (password) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None,
+        keyboardOptions = KeyboardOptions(
+            keyboardType = keyboardType,
+            imeAction = ImeAction.Done
+        ),
         textStyle = TextStyle(Ink, 15.sp, FontWeight.Medium),
         cursorBrush = androidx.compose.ui.graphics.SolidColor(Carrot),
         modifier = Modifier.fillMaxWidth().height(55.dp).background(Surface, RoundedCornerShape(17.dp)).border(1.5.dp, if (value.isNotEmpty()) Ink else Muted, RoundedCornerShape(17.dp)).padding(horizontal = 16.dp),
