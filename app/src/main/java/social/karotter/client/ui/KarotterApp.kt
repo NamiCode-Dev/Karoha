@@ -266,7 +266,11 @@ import social.karotter.client.data.SavedCredentialAccount
 import social.karotter.client.data.hasValidatedInternet
 import social.karotter.client.BackgroundNotificationManager
 import social.karotter.client.AppVisibility
+import social.karotter.client.AppUpdateInfo
+import social.karotter.client.AppUpdateManager
+import social.karotter.client.InstallApkResult
 import social.karotter.client.NotificationNavigationTarget
+import java.io.File
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDateTime
@@ -275,6 +279,7 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 private const val AUTO_REFRESH_INTERVAL_MS = 15_000L
 
@@ -575,6 +580,31 @@ fun KarotterApp(
     var returnAccountIdentifier by remember { mutableStateOf<String?>(null) }
     var dataFailure by remember { mutableStateOf<String?>(null) }
     var recoveryBusy by remember { mutableStateOf<String?>(null) }
+    var updateCheckStarted by remember { mutableStateOf(false) }
+    var availableUpdate by remember { mutableStateOf<AppUpdateInfo?>(null) }
+    var updateDownloading by remember { mutableStateOf(false) }
+    var updateProgress by remember { mutableStateOf(0f) }
+    var updateError by remember { mutableStateOf<String?>(null) }
+    var downloadedUpdateApk by remember { mutableStateOf<File?>(null) }
+    val creatorPromptPrefs = remember {
+        context.getSharedPreferences("karoha_creator_follow_prompt_v1", android.content.Context.MODE_PRIVATE)
+    }
+    var creatorProfile by remember { mutableStateOf<ApiUser?>(null) }
+    var creatorFollowBusy by remember { mutableStateOf(false) }
+    var creatorFollowError by remember { mutableStateOf<String?>(null) }
+    val installPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        val apk = downloadedUpdateApk
+        if (apk != null) {
+            when (val result = AppUpdateManager.launchInstaller(context, apk)) {
+                InstallApkResult.Launched -> availableUpdate = null
+                InstallApkResult.PermissionRequired ->
+                    updateError = "このアプリからのインストールを許可すると更新できます"
+                is InstallApkResult.Failure -> updateError = result.message
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         delay(1_050L)
@@ -586,6 +616,41 @@ fun KarotterApp(
             initialLaunchAnimationExiting = true
             delay(320L)
             initialLaunchAnimationVisible = false
+        }
+    }
+
+    LaunchedEffect(networkAvailable, initialLaunchAnimationVisible) {
+        if (networkAvailable && !initialLaunchAnimationVisible && !updateCheckStarted) {
+            updateCheckStarted = true
+            val result = withContext(Dispatchers.IO) {
+                AppUpdateManager.checkForUpdate(context)
+            }
+            result.getOrNull()?.let {
+                availableUpdate = it
+                updateError = null
+            }
+        }
+    }
+
+    LaunchedEffect(user?.id, networkAvailable) {
+        val activeUser = user ?: return@LaunchedEffect
+        if (!networkAvailable ||
+            activeUser.username.equals("namicode", ignoreCase = true) ||
+            creatorPromptPrefs.getBoolean("shown_${activeUser.id}", false)
+        ) {
+            creatorProfile = null
+            return@LaunchedEffect
+        }
+        when (val result = withContext(Dispatchers.IO) { api.user("namicode") }) {
+            is ApiResult.Success -> {
+                if (result.value.isFollowing) {
+                    creatorPromptPrefs.edit().putBoolean("shown_${activeUser.id}", true).apply()
+                } else {
+                    creatorProfile = result.value
+                    creatorFollowError = null
+                }
+            }
+            is ApiResult.Failure -> Unit
         }
     }
 
@@ -779,6 +844,86 @@ fun KarotterApp(
                 user = null
             }
         ) } }
+    }
+
+    availableUpdate?.let { update ->
+        AppUpdateDialog(
+            update = update,
+            downloading = updateDownloading,
+            progress = updateProgress,
+            error = updateError,
+            onDismiss = {
+                if (!updateDownloading) {
+                    availableUpdate = null
+                    updateError = null
+                }
+            },
+            onInstall = {
+                if (!updateDownloading) {
+                    updateDownloading = true
+                    updateProgress = 0f
+                    updateError = null
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) {
+                            AppUpdateManager.downloadApk(context, update) { progress ->
+                                scope.launch { updateProgress = progress }
+                            }
+                        }
+                        updateDownloading = false
+                        result.fold(
+                            onSuccess = { apk ->
+                                downloadedUpdateApk = apk
+                                when (val installResult = AppUpdateManager.launchInstaller(context, apk)) {
+                                    InstallApkResult.Launched -> availableUpdate = null
+                                    InstallApkResult.PermissionRequired -> {
+                                        installPermissionLauncher.launch(
+                                            AppUpdateManager.installPermissionIntent(context)
+                                        )
+                                    }
+                                    is InstallApkResult.Failure -> updateError = installResult.message
+                                }
+                            },
+                            onFailure = {
+                                updateError = it.message ?: "更新をダウンロードできませんでした"
+                            }
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    if (availableUpdate == null) {
+        creatorProfile?.let { profile ->
+            CreatorFollowDialog(
+                profile = profile,
+                following = profile.isFollowing,
+                busy = creatorFollowBusy,
+                error = creatorFollowError,
+                onDismiss = {
+                    user?.id?.let { creatorPromptPrefs.edit().putBoolean("shown_$it", true).apply() }
+                    creatorProfile = null
+                },
+                onFollow = {
+                    if (!creatorFollowBusy) {
+                        creatorFollowBusy = true
+                        creatorFollowError = null
+                        scope.launch {
+                            when (val result = withContext(Dispatchers.IO) { api.follow(profile.id, true) }) {
+                                is ApiResult.Success -> {
+                                    creatorProfile = profile.copy(isFollowing = true)
+                                    user?.id?.let {
+                                        creatorPromptPrefs.edit().putBoolean("shown_$it", true).apply()
+                                    }
+                                }
+                                is ApiResult.Failure -> creatorFollowError = result.message
+                            }
+                            creatorFollowBusy = false
+                        }
+                    }
+                }
+            )
+        }
     }
 }
 
@@ -2097,6 +2242,189 @@ private fun KarohaAppLogo(size: Dp) {
             this.size.width * (3f / 108f),
             point(68f, 71f)
         )
+    }
+}
+
+@Composable
+private fun AppUpdateDialog(
+    update: AppUpdateInfo,
+    downloading: Boolean,
+    progress: Float,
+    error: String?,
+    onDismiss: () -> Unit,
+    onInstall: () -> Unit
+) {
+    Dialog(
+        onDismissRequest = { if (!downloading) onDismiss() },
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 18.dp).navigationBarsPadding()
+                .clip(RoundedCornerShape(28.dp)).background(Paper)
+                .border(1.dp, Hairline, RoundedCornerShape(28.dp)).padding(22.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                KarohaAppLogo(52.dp)
+                Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f)) {
+                    KText("KAROHA UPDATE", 9, Carrot, FontWeight.Black, letterSpacing = 1.8f)
+                    Spacer(Modifier.height(3.dp))
+                    KText("新しいKarohaがあります", 19, Ink, FontWeight.Black)
+                }
+            }
+            Spacer(Modifier.height(19.dp))
+            Box(
+                Modifier.fillMaxWidth().background(Surface, RoundedCornerShape(18.dp))
+                    .border(1.dp, Hairline, RoundedCornerShape(18.dp)).padding(15.dp)
+            ) {
+                Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        KText(update.title.ifBlank { update.tagName }, 14, Ink, FontWeight.Black, modifier = Modifier.weight(1f))
+                        if (update.apkSize > 0L) {
+                            KText("%.1f MB".format(update.apkSize / 1024f / 1024f), 9, Muted, FontWeight.Bold)
+                        }
+                    }
+                    if (update.notes.isNotBlank()) {
+                        Spacer(Modifier.height(9.dp))
+                        KText(update.notes, 10, Muted, lineHeight = 16f, maxLines = 5)
+                    }
+                }
+            }
+            if (downloading) {
+                Spacer(Modifier.height(17.dp))
+                val shownProgress = progress.coerceIn(0f, 1f)
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    KText("ダウンロード中", 10, Ink, FontWeight.Black, modifier = Modifier.weight(1f))
+                    KText("${(shownProgress * 100).roundToInt()}%", 10, Carrot, FontWeight.Black)
+                }
+                Spacer(Modifier.height(8.dp))
+                Box(Modifier.fillMaxWidth().height(7.dp).clip(CircleShape).background(Hairline)) {
+                    Box(
+                        Modifier.fillMaxWidth(shownProgress.coerceAtLeast(.015f)).fillMaxHeight()
+                            .clip(CircleShape).background(Carrot)
+                    )
+                }
+            }
+            if (!error.isNullOrBlank()) {
+                Spacer(Modifier.height(13.dp))
+                KText(error, 10, Color(0xFFE05252), FontWeight.Bold, lineHeight = 16f)
+            }
+            Spacer(Modifier.height(19.dp))
+            Box(
+                Modifier.fillMaxWidth().height(50.dp).clip(RoundedCornerShape(16.dp))
+                    .background(if (downloading) Muted.copy(alpha = .35f) else Strong)
+                    .clickable(enabled = !downloading) { onInstall() },
+                contentAlignment = Alignment.Center
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CustomIcon(IconType.SEND, OnStrong, 18.dp)
+                    Spacer(Modifier.width(8.dp))
+                    KText(if (error == null) "ダウンロードして更新" else "もう一度試す", 11, OnStrong, FontWeight.Black)
+                }
+            }
+            if (!downloading) {
+                Spacer(Modifier.height(13.dp))
+                KText(
+                    "あとで", 10, Muted, FontWeight.Bold,
+                    modifier = Modifier.align(Alignment.CenterHorizontally).clickable { onDismiss() }.padding(6.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CreatorFollowDialog(
+    profile: ApiUser,
+    following: Boolean,
+    busy: Boolean,
+    error: String?,
+    onDismiss: () -> Unit,
+    onFollow: () -> Unit
+) {
+    Dialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 18.dp).navigationBarsPadding()
+                .clip(RoundedCornerShape(28.dp)).background(Paper)
+                .border(1.dp, Hairline, RoundedCornerShape(28.dp)).padding(22.dp)
+        ) {
+            KText("KAROHA NEWS", 9, Carrot, FontWeight.Black, letterSpacing = 1.8f)
+            Spacer(Modifier.height(7.dp))
+            KText("Karohaの最新情報を受け取る", 21, Ink, FontWeight.Black)
+            Spacer(Modifier.height(7.dp))
+            KText("アップデートや新機能のお知らせを見逃さないよう、NamiCodeのフォローをおすすめします。", 10, Muted, lineHeight = 17f)
+            Spacer(Modifier.height(18.dp))
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(Surface)
+                    .border(1.dp, Hairline, RoundedCornerShape(20.dp)).padding(15.dp),
+                verticalAlignment = Alignment.Top
+            ) {
+                Box(
+                    Modifier.size(54.dp).clip(RoundedCornerShape(17.dp)).background(PaleCarrot),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (!profile.avatarUrl.isNullOrBlank()) {
+                        AsyncImage(profile.avatarUrl, profile.displayName, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                    } else {
+                        KText(profile.displayName.take(1), 18, Carrot, FontWeight.Black)
+                    }
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        KText(profile.displayName, 14, Ink, FontWeight.Black, maxLines = 1)
+                        AccountMarks(
+                            profile.officialMarks.ifEmpty { listOf(profile.officialMark) },
+                            profile.isBotAccount,
+                            profile.isParodyAccount,
+                            profile.isPrivate,
+                            compact = true
+                        )
+                    }
+                    KText("@${profile.username}", 10, Muted, FontWeight.Bold, maxLines = 1)
+                    if (profile.bio.isNotBlank()) {
+                        Spacer(Modifier.height(7.dp))
+                        KText(profile.bio, 10, Ink, lineHeight = 15f, maxLines = 3)
+                    }
+                    Spacer(Modifier.height(7.dp))
+                    KText("${profile.followersCount} フォロワー", 9, Muted, FontWeight.Bold)
+                }
+            }
+            if (!error.isNullOrBlank()) {
+                Spacer(Modifier.height(12.dp))
+                KText(error, 10, Color(0xFFE05252), FontWeight.Bold, lineHeight = 16f)
+            }
+            Spacer(Modifier.height(18.dp))
+            Box(
+                Modifier.fillMaxWidth().height(50.dp).clip(RoundedCornerShape(16.dp))
+                    .background(if (following) Surface else Strong)
+                    .border(if (following) 1.dp else 0.dp, if (following) Hairline else Color.Transparent, RoundedCornerShape(16.dp))
+                    .clickable(enabled = !busy && !following) { onFollow() },
+                contentAlignment = Alignment.Center
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CustomIcon(if (following) IconType.CHECK else IconType.PERSON, if (following) Ink else OnStrong, 18.dp)
+                    Spacer(Modifier.width(8.dp))
+                    KText(
+                        when {
+                            busy -> "フォローしています…"
+                            following -> "フォロー中"
+                            else -> "NamiCodeをフォロー"
+                        },
+                        11, if (following) Ink else OnStrong, FontWeight.Black
+                    )
+                }
+            }
+            Spacer(Modifier.height(13.dp))
+            KText(
+                if (following) "閉じる" else "今はしない", 10, Muted, FontWeight.Bold,
+                modifier = Modifier.align(Alignment.CenterHorizontally)
+                    .clickable(enabled = !busy) { onDismiss() }.padding(6.dp)
+            )
+        }
     }
 }
 
