@@ -134,6 +134,7 @@ import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -160,6 +161,9 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -369,6 +373,7 @@ private val LocalPostMenuEnvironment = staticCompositionLocalOf<PostMenuEnvironm
 private val LocalPostMenuResultHandler = staticCompositionLocalOf<((PostMenuAction, Post) -> Unit)?> { null }
 private val LocalNavigationActive = staticCompositionLocalOf { true }
 private val LocalLinkPreviewApi = staticCompositionLocalOf<KarotterApi?> { null }
+private val LocalViewerIsPro = staticCompositionLocalOf { false }
 
 private data class RekarotState(val rekaroted: Boolean, val count: Int)
 private data class PostInteractionState(
@@ -418,13 +423,18 @@ private enum class Section(val label: String) {
 
 private sealed interface Overlay {
     data class PostDetail(val post: Post) : Overlay
-    data class UserDetail(val post: Post) : Overlay
+    data class UserDetail(
+        val post: Post,
+        val retainedState: UserDetailRetainedState = UserDetailRetainedState()
+    ) : Overlay
     data class StoryDetail(val story: ApiStory) : Overlay
     data class BoardDetail(val board: ApiBoard) : Overlay
     data object BoardCreate : Overlay
     data class DmConversation(val group: ApiDmGroup) : Overlay
     data class HashtagSearch(val tag: String) : Overlay
-    data object Notifications : Overlay
+    data class Notifications(
+        val retainedState: NotificationsRetainedState = NotificationsRetainedState()
+    ) : Overlay
 }
 
 private data class ComposeTarget(
@@ -505,6 +515,40 @@ private data class Post(
     val parentId: Long? = null,
     val canQuote: Boolean = true
 )
+
+private class ProfilePageRetainedState {
+    val selectedKind = mutableStateOf("posts")
+    val userPosts = mutableStateOf<List<Post>>(emptyList())
+    val nextPage = mutableIntStateOf(1)
+    val nextCursor = mutableStateOf<Long?>(null)
+    val hasNext = mutableStateOf(true)
+    val loadingMore = mutableStateOf(false)
+    val refreshing = mutableStateOf(false)
+    val loadedKind = mutableStateOf<String?>(null)
+    val listState = LazyListState()
+}
+
+private class UserDetailRetainedState {
+    val profile = mutableStateOf<ApiUser?>(null)
+    val reloadKey = mutableIntStateOf(0)
+    val loadedReloadKey = mutableIntStateOf(-1)
+    val page = ProfilePageRetainedState()
+}
+
+private class NotificationsRetainedState {
+    val notifications = mutableStateOf<List<ApiNotification>>(emptyList())
+    val loading = mutableStateOf(false)
+    val nextPage = mutableIntStateOf(1)
+    val hasMore = mutableStateOf(true)
+    val error = mutableStateOf<String?>(null)
+    val selectedType = mutableStateOf<String?>(null)
+    val requestRevision = mutableIntStateOf(0)
+    val initialized = mutableStateOf(false)
+    val loadedType = mutableStateOf<String?>(null)
+    val readMarked = mutableStateOf(false)
+    val filterListState = LazyListState()
+    val listState = LazyListState()
+}
 
 private fun postStableKey(post: Post): String =
     post.id?.let { "post:$it" }
@@ -1535,6 +1579,10 @@ private fun MainShell(
         LocalRekarotStates provides rekarotStates,
         LocalPostInteractionStates provides postInteractionStates,
         LocalLinkPreviewApi provides api,
+        LocalViewerIsPro provides (
+            currentUser?.subscriptionPlan.equals("PRO", ignoreCase = true) &&
+                currentUser?.subscriptionStatus.equals("ACTIVE", ignoreCase = true)
+            ),
         LocalPostMenuEnvironment provides PostMenuEnvironment(currentUser?.id, ::executePostMenuAction, ::openPostEditor)
     ) {
     val bottomDockHazeState = remember { HazeState() }
@@ -1569,7 +1617,7 @@ private fun MainShell(
                     },
                     onLoadMore = ::loadMoreHome,
                     unreadCount = unreadCount,
-                    onNotifications = { unreadCount = 0; pushOverlay(Overlay.Notifications) },
+                    onNotifications = { unreadCount = 0; pushOverlay(Overlay.Notifications()) },
                     onCreateStory = { storyCreatorOpen = true },
                     onStory = ::openStory,
                     onOpen = { pushOverlay(Overlay.PostDetail(it)) },
@@ -1603,7 +1651,7 @@ private fun MainShell(
                     latestCommunityPost = latestCommunityPost
                 )
                 Section.DM -> DmScreen(api, currentUser) { dmConversationOpen = it }
-                Section.PROFILE -> MyPageScreen(currentUser, api, themeKey, followsSystemTheme, onThemeChange, onLogout, onAccountChanged, onAddAccount, { unreadCount = 0; pushOverlay(Overlay.Notifications) }, { pushOverlay(Overlay.PostDetail(it)) }, { openComposer(parent = it) }, { openComposer(quote = it) }, ::rekarot, ::like, ::bookmark, { openComposer() }, { openComposer(question = it) }, latestCreatedPost) { pushOverlay(Overlay.UserDetail(it.toProfilePost())) }
+                Section.PROFILE -> MyPageScreen(currentUser, api, themeKey, followsSystemTheme, onThemeChange, onLogout, onAccountChanged, onAddAccount, { unreadCount = 0; pushOverlay(Overlay.Notifications()) }, { pushOverlay(Overlay.PostDetail(it)) }, { openComposer(parent = it) }, { openComposer(quote = it) }, ::rekarot, ::like, ::bookmark, { openComposer() }, { openComposer(question = it) }, latestCreatedPost) { pushOverlay(Overlay.UserDetail(it.toProfilePost())) }
                 }
             }
         }
@@ -1648,6 +1696,7 @@ private fun MainShell(
             EditPostDialog(
                 post = target,
                 api = api,
+                characterLimit = currentUser?.postCharacterLimit ?: 200,
                 onDismiss = {
                     editingPost = null
                     editResultHandler = null
@@ -1770,7 +1819,7 @@ private fun MainShell(
                     onClick = {
                         notificationToastVisible = false
                         notification.post?.let { pushOverlay(Overlay.PostDetail(it.toUiPost())) }
-                            ?: pushOverlay(Overlay.Notifications)
+                            ?: pushOverlay(Overlay.Notifications())
                     },
                     onDismiss = { notificationToastVisible = false }
                 )
@@ -1786,7 +1835,7 @@ private fun MainShell(
             BackHandler(enabled = overlayStack.isNotEmpty()) { popOverlay() }
             when (val target = overlay) {
                 is Overlay.PostDetail -> PostDetailScreen(target.post, api, ::popOverlay, { openComposer(parent = it) }, { openComposer(quote = it) }, ::rekarot, ::like, ::bookmark, { pushOverlay(Overlay.UserDetail(it)) })
-                is Overlay.UserDetail -> UserDetailScreen(target.post, api, currentUser?.id, ::popOverlay, { pushOverlay(Overlay.PostDetail(it)) }, { openComposer(parent = it) }, { openComposer(quote = it) }, ::rekarot, ::like, ::bookmark, { openComposer() }, ::startDirectMessage) { pushOverlay(Overlay.UserDetail(it.toProfilePost())) }
+                is Overlay.UserDetail -> UserDetailScreen(target.post, target.retainedState, api, currentUser?.id, ::popOverlay, { pushOverlay(Overlay.PostDetail(it)) }, { openComposer(parent = it) }, { openComposer(quote = it) }, ::rekarot, ::like, ::bookmark, { openComposer() }, ::startDirectMessage) { pushOverlay(Overlay.UserDetail(it.toProfilePost())) }
                 is Overlay.StoryDetail -> StoryDetailScreen(
                     story = target.story,
                     transitionDirection = storyTransitionDirection,
@@ -1830,7 +1879,7 @@ private fun MainShell(
                     onLeft = ::popOverlay
                 )
                 is Overlay.HashtagSearch -> HashtagSearchScreen(target.tag, api, ::popOverlay, { pushOverlay(Overlay.PostDetail(it)) }, { openComposer(parent = it) }, { openComposer(quote = it) }, ::rekarot, ::like, ::bookmark, { pushOverlay(Overlay.UserDetail(it.toProfilePost())) }, { openComposer() })
-                Overlay.Notifications -> NotificationsScreen(api, ::popOverlay) { pushOverlay(Overlay.PostDetail(it)) }
+                is Overlay.Notifications -> NotificationsScreen(api, target.retainedState, ::popOverlay) { pushOverlay(Overlay.PostDetail(it)) }
                 null -> Unit
             }
         }
@@ -4018,6 +4067,17 @@ private fun SubscriptionBadge(plan: String, status: String, visible: Boolean, co
 
 private val FrequentReactionEmojis = listOf("👈", "👍", "❤️", "😂", "😮", "😢", "🔥")
 
+private val BmpReactionEmojis = listOf(
+    "☀️", "☁️", "☂️", "☃️", "☄️", "☎️", "☑️", "☔", "☕", "☘️", "☝️", "☠️",
+    "☢️", "☣️", "☦️", "☪️", "☮️", "☯️", "☸️", "☹️", "☺️", "♀️", "♂️", "♟️",
+    "♠️", "♣️", "♥️", "♦️", "♨️", "♻️", "♾️", "⚒️", "⚔️", "⚕️", "⚖️", "⚗️",
+    "⚙️", "⚛️", "⚜️", "⚠️", "⚡", "⚧️", "⚪", "⚫", "⚰️", "⚱️", "⛏️", "⛑️",
+    "⛓️", "⛩️", "⛰️", "⛱️", "⛲", "⛳", "⛴️", "⛵", "⛷️", "⛸️", "⛹️", "⛺",
+    "⛽", "✂️", "✅", "✈️", "✉️", "✊", "✋", "✌️", "✍️", "✏️", "✒️", "✔️",
+    "✖️", "✝️", "✡️", "✨", "✳️", "✴️", "❄️", "❇️", "❌", "❎", "❓", "❔",
+    "❕", "❗", "❣️", "❤️", "⭐", "⭕", "➕", "➖", "➗", "➡️", "➰", "➿"
+)
+
 private val AllReactionEmojis: List<String> by lazy {
     val joinedEmoji = listOf(
         "☺️", "☹️", "❤️", "❣️", "❤️‍🔥", "❤️‍🩹", "👁️‍🗨️", "🐻‍❄️",
@@ -4030,8 +4090,6 @@ private val AllReactionEmojis: List<String> by lazy {
         "👩‍❤️‍💋‍👩", "👨‍❤️‍💋‍👨"
     )
     val ranges = listOf(
-        0x2600..0x26FF,
-        0x2700..0x27BF,
         0x1F300..0x1F5FF,
         0x1F600..0x1F64F,
         0x1F680..0x1F6FF,
@@ -4040,12 +4098,13 @@ private val AllReactionEmojis: List<String> by lazy {
     )
     buildList {
         addAll(FrequentReactionEmojis)
+        addAll(BmpReactionEmojis)
         addAll(joinedEmoji)
         ranges.forEach { range ->
             range.forEach { codePoint ->
                 if (Character.isDefined(codePoint) && codePoint !in 0x1F3FB..0x1F3FF) {
                     val value = String(Character.toChars(codePoint))
-                    add(if (codePoint in 0x2600..0x27BF) "$value\uFE0F" else value)
+                    add(value)
                 }
             }
         }
@@ -4056,6 +4115,119 @@ private val AllReactionEmojis: List<String> by lazy {
         }
     }.distinct()
 }
+
+private data class ReactionOption(
+    val value: String,
+    val label: String,
+    val category: String,
+    val isPro: Boolean = false,
+    val searchKeywords: String = label
+)
+
+private val ProReactionOptions = listOf(
+    "pro:ai" to "愛", "pro:arara" to "あらら", "pro:arigato" to "ありがとう",
+    "pro:bananala" to "ばななぁ", "pro:bimi" to "美味", "pro:bimyou" to "微妙",
+    "pro:critical" to "クリティカル", "pro:daijoubu" to "大丈夫？", "pro:daisuki" to "だいすき",
+    "pro:dakara" to "だから", "pro:dame" to "だめ", "pro:desu.png" to "です",
+    "pro:e" to "え？", "pro:ee" to "えぇ…", "pro:fanburu" to "ファンブル",
+    "pro:furaidopotato" to "ふらいどぽてと", "pro:ganbare" to "がんばれ", "pro:gekiatsu" to "激アツ",
+    "pro:gomen" to "ごめんね", "pro:hai-gimon" to "はい？", "pro:hai" to "はい",
+    "pro:hiku" to "引", "pro:hosii" to "ほしい", "pro:hurokuu" to "風呂食う",
+    "pro:igyo" to "偉業", "pro:iie" to "いいえ", "pro:iiyo" to "いいよ",
+    "pro:kakkoyosugiru" to "かっこよすぎる", "pro:kanasii" to "悲しい", "pro:kandou" to "感動",
+    "pro:kane" to "金", "pro:kansya" to "感謝", "pro:karoart" to "かろあーと",
+    "pro:karoearth" to "かろあーす", "pro:karon" to "かろん", "pro:karotter" to "Karotter",
+    "pro:kawaii" to "かわいい", "pro:kekkonsitai" to "結婚したい", "pro:kirei" to "綺麗",
+    "pro:kore" to "これ", "pro:kowasugiru" to "怖すぎる", "pro:kurusii" to "苦しい",
+    "pro:kusa" to "草", "pro:mazi" to "マジ？", "pro:mazide" to "マジで",
+    "pro:medaka" to "めだか", "pro:medetai" to "めでたい", "pro:melonsoda" to "めろんそーだ",
+    "pro:nani" to "なに？", "pro:odaizini" to "お大事に…", "pro:ohayo" to "おはよ",
+    "pro:otsukaresama" to "おつかれ様", "pro:owari" to "終", "pro:owatta" to "おわった",
+    "pro:oyasumi" to "おやすみ", "pro:sagidesu" to "詐欺です", "pro:saida-" to "さいだー",
+    "pro:saikoukaryoku" to "最高火力", "pro:saikousugiru" to "最高すぎる", "pro:sayonara" to "さよなら",
+    "pro:shihiro" to "しひろ", "pro:sinpaidayo" to "心配だよ", "pro:sonnnawake" to "そんなわけ",
+    "pro:sorena" to "それな", "pro:sugoi" to "すごい", "pro:suki" to "すき",
+    "pro:syogyomujo" to "諸行無常", "pro:syunkasyuutouasahiruban" to "春夏秋冬朝昼晩",
+    "pro:takuan" to "たくあん", "pro:tasukaru" to "助かる", "pro:tasukete" to "たすけて",
+    "pro:tensai" to "天才！", "pro:thinkkaron1" to "疑問（かろん）", "pro:this" to "これは",
+    "pro:tigaimasu" to "違います", "pro:umai" to "うまい", "pro:uo-!!" to "うおー！！",
+    "pro:urayamasii" to "羨ましい", "pro:wakaru" to "わかる", "pro:watashihakami" to "私は神",
+    "pro:yamete" to "やめて", "pro:yasasii" to "やさしい", "pro:yoroshiku" to "よろしく",
+    "pro:youkoso" to "ようこそ", "pro:yurusanai" to "許さない", "pro:yurushite" to "ゆるして",
+    "pro:yuunousugiru" to "有能すぎる"
+).map { (value, label) -> ReactionOption(value, label, "Pro", isPro = true, searchKeywords = "$label $value Pro プロ") }
+
+private fun reactionCategory(value: String): String {
+    if (value in FrequentReactionEmojis) return "よく使う"
+    val codePoint = value.codePointAt(0)
+    return when {
+        codePoint in 0x1F600..0x1F64F || codePoint in 0x1F910..0x1F92F -> "表情"
+        codePoint in 0x1F440..0x1F487 || codePoint in 0x1F90C..0x1F9B3 -> "人・ジェスチャー"
+        codePoint in 0x1F400..0x1F43F || codePoint in 0x1F980..0x1F9AE ||
+            codePoint in 0x1F330..0x1F343 -> "動物・自然"
+        codePoint in 0x1F32D..0x1F37F || codePoint in 0x1F950..0x1F96F -> "食べ物"
+        codePoint in 0x1F1E6..0x1F1FF -> "旗"
+        else -> "記号・その他"
+    }
+}
+
+private val StandardReactionOptions: List<ReactionOption> by lazy {
+    AllReactionEmojis.filter(::isEmojiReaction).map {
+        ReactionOption(it, it, reactionCategory(it), searchKeywords = emojiJapaneseKeywords(it))
+    }
+}
+
+private val CommonEmojiJapaneseKeywords = mapOf(
+    "👈" to "左 指差し 指 ゆび", "👍" to "いいね 親指 サムズアップ", "❤️" to "ハート 赤 愛 好き",
+    "😂" to "笑い 泣き笑い 面白い 顔", "😮" to "驚き びっくり 顔", "😢" to "泣く 悲しい 涙 顔",
+    "🔥" to "炎 火 熱い", "😀" to "笑顔 にこにこ 顔", "😃" to "笑顔 嬉しい 顔",
+    "😄" to "笑顔 嬉しい 顔", "😁" to "笑顔 にやり 顔", "😊" to "笑顔 ほほえみ 顔",
+    "😍" to "大好き ハート 目 顔", "🥰" to "大好き ハート 笑顔", "😘" to "キス 投げキッス 顔",
+    "😎" to "サングラス かっこいい 顔", "🤔" to "考える 疑問 顔", "🙄" to "白目 顔",
+    "😡" to "怒り 怒る 顔", "😭" to "大泣き 悲しい 涙 顔", "😱" to "恐怖 叫ぶ びっくり 顔",
+    "🥳" to "お祝い パーティー 顔", "🤩" to "星 目 興奮 顔", "🤯" to "衝撃 爆発 びっくり 顔",
+    "🙏" to "祈る お願い ありがとう 手", "👏" to "拍手 おめでとう 手", "🙌" to "万歳 やった 手",
+    "👌" to "OK オーケー 手", "✌️" to "ピース 勝利 手", "🤝" to "握手 協力 手",
+    "💪" to "筋肉 力 強い 腕", "👀" to "目 見る 注目", "💯" to "百点 満点",
+    "✨" to "きらきら 輝き 星", "⭐" to "星 スター", "🎉" to "お祝い クラッカー",
+    "🎊" to "お祝い くす玉", "🎂" to "誕生日 ケーキ", "🎁" to "プレゼント 贈り物",
+    "💡" to "電球 アイデア ひらめき", "💬" to "会話 コメント 吹き出し", "💤" to "睡眠 眠い",
+    "✅" to "チェック 完了 正解", "❌" to "バツ 不正解 だめ", "❓" to "疑問 質問 はてな",
+    "❗" to "びっくり 注意 感嘆符", "⚠️" to "警告 注意", "🚀" to "ロケット 宇宙",
+    "🌸" to "桜 花 春", "🌈" to "虹", "☀️" to "太陽 晴れ 天気", "☁️" to "雲 曇り 天気",
+    "☔" to "傘 雨 天気", "❄️" to "雪 冬", "🐶" to "犬 いぬ 動物", "🐱" to "猫 ねこ 動物",
+    "🐰" to "うさぎ 動物", "🐻" to "くま 熊 動物", "🍎" to "りんご 林檎 果物",
+    "🍌" to "バナナ 果物", "🍓" to "いちご 苺 果物", "🍔" to "ハンバーガー 食べ物",
+    "🍕" to "ピザ 食べ物", "🍣" to "寿司 すし 食べ物", "🍜" to "ラーメン 麺 食べ物",
+    "🍰" to "ケーキ スイーツ 食べ物", "☕" to "コーヒー 飲み物", "🍺" to "ビール 酒 飲み物"
+)
+
+private fun emojiJapaneseKeywords(value: String): String {
+    CommonEmojiJapaneseKeywords[value]?.let { return "$value $it" }
+    val category = reactionCategory(value)
+    val categoryKeywords = when (category) {
+        "表情" -> "顔 表情 気持ち 感情"
+        "人・ジェスチャー" -> "人 手 指 ジェスチャー 動作"
+        "動物・自然" -> "動物 生き物 自然 植物 花"
+        "食べ物" -> "食べ物 飲み物 料理 果物"
+        "旗" -> "旗 国 国旗"
+        "よく使う" -> "よく使う 人気"
+        else -> "記号 物 道具 スポーツ 乗り物 絵文字"
+    }
+    return "$value $category $categoryKeywords"
+}
+
+private fun isEmojiReaction(value: String): Boolean {
+    if (value.startsWith("pro:", ignoreCase = true)) return true
+    if (value in FrequentReactionEmojis) return true
+    val firstCodePoint = value.codePointAtOrNull(0) ?: return false
+    return firstCodePoint in 0x1F300..0x1FAFF ||
+        firstCodePoint in 0x1F1E6..0x1F1FF ||
+        value in BmpReactionEmojis
+}
+
+private fun String.codePointAtOrNull(index: Int): Int? =
+    takeIf { index in indices }?.let { Character.codePointAt(it, index) }
 
 @Composable
 private fun officialMarkColor(value: String): Color = when (value.uppercase()) {
@@ -4115,7 +4287,8 @@ private fun AccountMarks(officialMarks: List<String>, isBot: Boolean, isParody: 
 private fun ReactionVisual(value: String, imageSize: Dp, emojiSize: Int) {
     val proName = value.takeIf { it.startsWith("pro:", ignoreCase = true) }
         ?.substringAfter(':')
-        ?.takeIf { it.matches(Regex("[A-Za-z0-9_-]{1,80}")) }
+        ?.removeSuffix(".png")
+        ?.takeIf { it.matches(Regex("[A-Za-z0-9_!-]{1,80}")) }
     var imageFailed by remember(value) { mutableStateOf(false) }
     if (proName != null && !imageFailed) {
         AsyncImage(
@@ -4132,6 +4305,7 @@ private fun ReactionVisual(value: String, imageSize: Dp, emojiSize: Int) {
 
 @Composable
 private fun ReactionStrip(reactions: List<ApiReaction>, pickerOpen: Boolean, onTogglePicker: () -> Unit, onReact: (String) -> Unit) {
+    val viewerIsPro = LocalViewerIsPro.current
     Column {
         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             item {
@@ -4140,11 +4314,14 @@ private fun ReactionStrip(reactions: List<ApiReaction>, pickerOpen: Boolean, onT
                 }
             }
             items(reactions) { reaction ->
+                val selectable = isEmojiReaction(reaction.emoji) &&
+                    (!reaction.emoji.startsWith("pro:", ignoreCase = true) || viewerIsPro)
                 Row(
                     Modifier.clip(RoundedCornerShape(12.dp))
                         .background(if (reaction.reacted) PaleCarrot else Surface)
                         .border(1.dp, if (reaction.reacted) Carrot else Hairline, RoundedCornerShape(12.dp))
-                        .clickable { onReact(reaction.emoji) }
+                        .clickable(enabled = selectable) { onReact(reaction.emoji) }
+                        .alpha(if (selectable) 1f else .52f)
                         .padding(horizontal = 9.dp, vertical = 5.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -4155,11 +4332,48 @@ private fun ReactionStrip(reactions: List<ApiReaction>, pickerOpen: Boolean, onT
             }
         }
         if (pickerOpen) {
+            var searchQuery by remember { mutableStateOf("") }
+            var selectedCategory by remember { mutableStateOf("よく使う") }
+            val searchFocusRequester = remember { FocusRequester() }
+            val softwareKeyboard = LocalSoftwareKeyboardController.current
+            var searchFocused by remember { mutableStateOf(false) }
+            val searchActive = searchFocused || searchQuery.isNotEmpty()
+            val searchBorderColor by animateColorAsState(
+                if (searchActive) Carrot else Hairline,
+                tween(180),
+                label = "reactionSearchBorder"
+            )
+            val searchUnderlineProgress by animateFloatAsState(
+                if (searchFocused) 1f else 0f,
+                tween(220, easing = FastOutSlowInEasing),
+                label = "reactionSearchUnderline"
+            )
+            val categories = remember(viewerIsPro) {
+                buildList {
+                    addAll(listOf("すべて", "よく使う", "表情", "人・ジェスチャー", "動物・自然", "食べ物", "記号・その他", "旗"))
+                    if (viewerIsPro) add("Pro")
+                }
+            }
+            val availableOptions = remember(viewerIsPro) {
+                if (viewerIsPro) StandardReactionOptions + ProReactionOptions else StandardReactionOptions
+            }
+            val visibleOptions = remember(availableOptions, searchQuery, selectedCategory) {
+                val normalizedQuery = searchQuery.trim().lowercase()
+                availableOptions.filter { option ->
+                    if (normalizedQuery.isNotEmpty()) {
+                        option.label.lowercase().contains(normalizedQuery) ||
+                            option.value.lowercase().contains(normalizedQuery) ||
+                            option.searchKeywords.lowercase().contains(normalizedQuery)
+                    } else {
+                        selectedCategory == "すべて" || option.category == selectedCategory
+                    }
+                }
+            }
             Dialog(onDismissRequest = onTogglePicker) {
                 Column(
                     Modifier
                         .fillMaxWidth()
-                        .heightIn(max = 570.dp)
+                        .heightIn(max = 610.dp)
                         .clip(RoundedCornerShape(24.dp))
                         .background(Paper)
                         .border(1.dp, Hairline, RoundedCornerShape(24.dp))
@@ -4168,33 +4382,111 @@ private fun ReactionStrip(reactions: List<ApiReaction>, pickerOpen: Boolean, onT
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             KText("リアクション", 18, Ink, FontWeight.Black)
-                            KText("端末で表示できる絵文字から選択", 10, Muted)
+                            KText(if (viewerIsPro) "絵文字とProリアクションから選択" else "カテゴリや検索から選択", 10, Muted)
                         }
                         Box(Modifier.size(34.dp).border(1.dp, Hairline, CircleShape).clickable { onTogglePicker() }, contentAlignment = Alignment.Center) { CustomIcon(IconType.CLOSE, Ink, 17.dp) }
                     }
-                    Spacer(Modifier.height(14.dp))
-                    KText("よく使う絵文字", 10, Muted, FontWeight.Black, letterSpacing = 1.2f)
-                    Spacer(Modifier.height(7.dp))
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                        items(FrequentReactionEmojis) { emoji ->
-                            Box(Modifier.size(40.dp).background(Surface, RoundedCornerShape(12.dp)).clickable { onReact(emoji) }, contentAlignment = Alignment.Center) {
-                                ReactionVisual(emoji, 26.dp, 21)
+                    Spacer(Modifier.height(12.dp))
+                    Row(
+                        Modifier.fillMaxWidth().height(42.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Surface)
+                            .border(if (searchFocused) 1.5.dp else 1.dp, searchBorderColor, RoundedCornerShape(14.dp))
+                            .drawBehind {
+                                if (searchUnderlineProgress > 0f) {
+                                    val halfWidth = size.width * searchUnderlineProgress / 2f
+                                    drawLine(
+                                        color = Carrot,
+                                        start = Offset(size.width / 2f - halfWidth, size.height - 1.dp.toPx()),
+                                        end = Offset(size.width / 2f + halfWidth, size.height - 1.dp.toPx()),
+                                        strokeWidth = 2.dp.toPx(),
+                                        cap = StrokeCap.Round
+                                    )
+                                }
+                            }
+                            .padding(horizontal = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            Modifier.size(28.dp).clickable {
+                                searchFocusRequester.requestFocus()
+                                softwareKeyboard?.show()
+                            },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CustomIcon(IconType.SEARCH, Muted, 16.dp)
+                        }
+                        Spacer(Modifier.width(9.dp))
+                        BasicTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            singleLine = true,
+                            textStyle = TextStyle(Ink, 12.sp, FontWeight.Medium),
+                            cursorBrush = androidx.compose.ui.graphics.SolidColor(Carrot),
+                            modifier = Modifier.weight(1f).fillMaxHeight()
+                                .focusRequester(searchFocusRequester)
+                                .onFocusChanged { searchFocused = it.isFocused },
+                            decorationBox = { inner ->
+                                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                                    if (searchQuery.isEmpty()) KText("日本語・絵文字・IDで検索", 11, Muted)
+                                    inner()
+                                }
+                            }
+                        )
+                        if (searchQuery.isNotEmpty()) {
+                            Box(Modifier.size(28.dp).clickable { searchQuery = "" }, contentAlignment = Alignment.Center) {
+                                CustomIcon(IconType.CLOSE, Muted, 14.dp)
                             }
                         }
                     }
-                    Spacer(Modifier.height(15.dp))
-                    KText("すべての絵文字", 10, Muted, FontWeight.Black, letterSpacing = 1.2f)
-                    Spacer(Modifier.height(7.dp))
-                    LazyVerticalGrid(
-                        columns = GridCells.Fixed(7),
-                        modifier = Modifier.fillMaxWidth().height(390.dp),
-                        contentPadding = PaddingValues(bottom = 12.dp)
-                    ) {
-                        items(AllReactionEmojis, key = { it }) { emoji ->
-                            Box(Modifier.size(40.dp).clip(RoundedCornerShape(10.dp)).clickable { onReact(emoji) }, contentAlignment = Alignment.Center) {
-                                ReactionVisual(emoji, 26.dp, 20)
+                    Spacer(Modifier.height(10.dp))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(categories, key = { it }) { category ->
+                            val selected = searchQuery.isEmpty() && selectedCategory == category
+                            Box(
+                                Modifier.clip(RoundedCornerShape(11.dp))
+                                    .background(if (selected) Strong else Surface)
+                                    .border(1.dp, if (selected) Strong else Hairline, RoundedCornerShape(11.dp))
+                                    .clickable {
+                                        searchQuery = ""
+                                        selectedCategory = category
+                                    }
+                                    .padding(horizontal = 11.dp, vertical = 7.dp)
+                            ) {
+                                KText(category, 9, if (selected) OnStrong else Muted, FontWeight.Black, maxLines = 1)
                             }
                         }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    if (visibleOptions.isEmpty()) {
+                        Box(Modifier.fillMaxWidth().height(300.dp), contentAlignment = Alignment.Center) {
+                            KText("一致するリアクションがありません", 11, Muted, FontWeight.Bold)
+                        }
+                    } else {
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(4),
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 260.dp, max = 430.dp),
+                        contentPadding = PaddingValues(bottom = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(5.dp),
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        items(visibleOptions, key = { it.value }) { option ->
+                            Column(
+                                Modifier.height(62.dp).clip(RoundedCornerShape(12.dp))
+                                    .background(Surface)
+                                    .clickable { onReact(option.value) }
+                                    .padding(horizontal = 4.dp, vertical = 5.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center
+                            ) {
+                                ReactionVisual(option.value, if (option.isPro) 28.dp else 27.dp, 21)
+                                if (option.isPro) {
+                                    Spacer(Modifier.height(3.dp))
+                                    KText(option.label, 7, Muted, FontWeight.Bold, maxLines = 1)
+                                }
+                            }
+                        }
+                    }
                     }
                 }
             }
@@ -4331,6 +4623,44 @@ private fun MediaGallery(media: List<ApiMedia>) {
                     }
                 }
                 if (rowItems.size == 1 && media.size > 1) Spacer(Modifier.weight(1f))
+            }
+        }
+    }
+}
+
+@Composable
+private fun SpoilerAwareMediaThumbnail(
+    media: ApiMedia,
+    modifier: Modifier = Modifier,
+    onOpen: () -> Unit
+) {
+    var spoilerRevealed by remember(media.url, media.spoiler) { mutableStateOf(!media.spoiler) }
+    Box(
+        modifier
+            .clip(RoundedCornerShape(3.dp))
+            .background(Hairline)
+            .clickable {
+                if (spoilerRevealed) onOpen() else spoilerRevealed = true
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        if (spoilerRevealed) {
+            AsyncImage(
+                model = media.url,
+                contentDescription = media.alt.ifBlank { "投稿メディア" },
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            Column(
+                Modifier.fillMaxSize().background(Strong).padding(8.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                CustomIcon(IconType.EYE, OnStrong, 19.dp)
+                Spacer(Modifier.height(5.dp))
+                KText("センシティブなメディア", 8, OnStrong, FontWeight.Black, textAlign = TextAlign.Center)
+                KText("タップして表示", 7, OnStrong.copy(alpha = .72f), FontWeight.Bold)
             }
         }
     }
@@ -6598,13 +6928,10 @@ private fun SearchResultsScreen(
                 ) { row ->
                     Row(Modifier.fillMaxWidth().height(126.dp)) {
                         row.forEach { (post, media) ->
-                            AsyncImage(
-                                model = media.url,
-                                contentDescription = media.alt.ifBlank { "投稿メディア" },
-                                modifier = Modifier.weight(1f).fillMaxHeight().padding(1.dp)
-                                    .clip(RoundedCornerShape(3.dp)).background(Hairline)
-                                    .clickable { onOpenMedia(post) },
-                                contentScale = ContentScale.Crop
+                            SpoilerAwareMediaThumbnail(
+                                media = media,
+                                modifier = Modifier.weight(1f).fillMaxHeight().padding(1.dp),
+                                onOpen = { onOpenMedia(post) }
                             )
                         }
                         repeat(3 - row.size) {
@@ -7185,14 +7512,16 @@ private fun EngagementUserRow(user: ApiUser, onClick: () -> Unit) {
 }
 
 @Composable
-private fun UserDetailScreen(initial: Post, api: KarotterApi, viewerUserId: Long?, onBack: () -> Unit, onOpen: (Post) -> Unit, onReply: (Post) -> Unit, onQuote: (Post) -> Unit, onRekarot: (Post, Boolean) -> Unit, onLike: (Post, Boolean) -> Unit, onBookmark: (Post, Boolean) -> Unit, onCompose: () -> Unit, onDm: (ApiUser) -> Unit, onUser: (ApiUser) -> Unit) {
-    var profile by remember(initial.handle) { mutableStateOf<ApiUser?>(null) }
-    var reloadKey by remember(initial.handle) { mutableIntStateOf(0) }
+private fun UserDetailScreen(initial: Post, retainedState: UserDetailRetainedState, api: KarotterApi, viewerUserId: Long?, onBack: () -> Unit, onOpen: (Post) -> Unit, onReply: (Post) -> Unit, onQuote: (Post) -> Unit, onRekarot: (Post, Boolean) -> Unit, onLike: (Post, Boolean) -> Unit, onBookmark: (Post, Boolean) -> Unit, onCompose: () -> Unit, onDm: (ApiUser) -> Unit, onUser: (ApiUser) -> Unit) {
+    var profile by retainedState.profile
+    var reloadKey by retainedState.reloadKey
     LaunchedEffect(initial.handle, reloadKey) {
+        if (profile != null && retainedState.loadedReloadKey.intValue == reloadKey) return@LaunchedEffect
         val found = withContext(Dispatchers.IO) { api.user(initial.handle.removePrefix("@")) }
         profile = (found as? ApiResult.Success)?.value ?: initial.toApiUser()
+        retainedState.loadedReloadKey.intValue = reloadKey
     }
-    profile?.let { SharedProfilePage(it, false, api, onBack, null, onOpen, onReply, onQuote, onRekarot, onLike, onBookmark, onCompose = onCompose, onUser = onUser, viewerUserId = viewerUserId, onDm = onDm, onProfileReload = { reloadKey += 1 }) }
+    profile?.let { SharedProfilePage(it, false, api, onBack, null, onOpen, onReply, onQuote, onRekarot, onLike, onBookmark, onCompose = onCompose, onUser = onUser, viewerUserId = viewerUserId, onDm = onDm, onProfileReload = { reloadKey += 1 }, retainedState = retainedState.page) }
         ?: Column(Modifier.fillMaxSize().background(Paper)) { OverlayHeader(initial.name, onBack); repeat(3) { LoadingPost() } }
 }
 
@@ -8214,14 +8543,14 @@ private fun BoardThreadComposer(
 }
 
 @Composable
-private fun NotificationsScreen(api: KarotterApi, onBack: () -> Unit, onPost: (Post) -> Unit) {
-    var notifications by remember { mutableStateOf<List<ApiNotification>>(emptyList()) }
-    var loading by remember { mutableStateOf(false) }
-    var nextPage by remember { mutableIntStateOf(1) }
-    var hasMore by remember { mutableStateOf(true) }
-    var error by remember { mutableStateOf<String?>(null) }
-    var selectedType by remember { mutableStateOf<String?>(null) }
-    var requestRevision by remember { mutableIntStateOf(0) }
+private fun NotificationsScreen(api: KarotterApi, retainedState: NotificationsRetainedState, onBack: () -> Unit, onPost: (Post) -> Unit) {
+    var notifications by retainedState.notifications
+    var loading by retainedState.loading
+    var nextPage by retainedState.nextPage
+    var hasMore by retainedState.hasMore
+    var error by retainedState.error
+    var selectedType by retainedState.selectedType
+    var requestRevision by retainedState.requestRevision
     val notificationFilters = remember {
         listOf(
             null to "すべて",
@@ -8241,7 +8570,7 @@ private fun NotificationsScreen(api: KarotterApi, onBack: () -> Unit, onPost: (P
             "SYSTEM" to "お知らせ"
         )
     }
-    val listState = rememberLazyListState()
+    val listState = retainedState.listState
     val scope = rememberCoroutineScope()
     fun notificationKey(item: ApiNotification) = "${item.id}:${item.type}:${item.actorName}:${item.createdAt}"
     suspend fun loadNextPage() {
@@ -8280,16 +8609,24 @@ private fun NotificationsScreen(api: KarotterApi, onBack: () -> Unit, onPost: (P
         if (revision == requestRevision && requestedType == selectedType) loading = false
     }
     LaunchedEffect(selectedType) {
+        if (retainedState.initialized.value && retainedState.loadedType.value == selectedType) {
+            return@LaunchedEffect
+        }
         notifications = emptyList()
         nextPage = 1
         hasMore = true
         error = null
         loading = false
+        retainedState.loadedType.value = selectedType
+        retainedState.initialized.value = true
         listState.scrollToItem(0)
         loadNextPage()
     }
     LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) { api.markNotificationsRead() }
+        if (!retainedState.readMarked.value) {
+            withContext(Dispatchers.IO) { api.markNotificationsRead() }
+            retainedState.readMarked.value = true
+        }
     }
     InfiniteLoadEffect(listState, notifications.size, hasMore, loading) {
         scope.launch { loadNextPage() }
@@ -8297,6 +8634,7 @@ private fun NotificationsScreen(api: KarotterApi, onBack: () -> Unit, onPost: (P
     Column(Modifier.fillMaxSize().background(Paper)) {
         OverlayHeader("通知", onBack)
         LazyRow(
+            state = retainedState.filterListState,
             modifier = Modifier.fillMaxWidth().background(Paper),
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
             horizontalArrangement = Arrangement.spacedBy(7.dp)
@@ -11909,7 +12247,7 @@ private fun SendQuestionDialog(
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, onBack: (() -> Unit)?, onLogout: (() -> Unit)?, onPost: (Post) -> Unit, onReply: (Post) -> Unit, onQuote: (Post) -> Unit, onRekarot: (Post, Boolean) -> Unit, onLike: (Post, Boolean) -> Unit, onBookmark: (Post, Boolean) -> Unit, onCompose: (() -> Unit)? = null, onUser: ((ApiUser) -> Unit)? = null, viewerUserId: Long? = null, onDm: ((ApiUser) -> Unit)? = null, newOwnPost: Post? = null, onProfileReload: (() -> Unit)? = null, onEditProfile: (() -> Unit)? = null) {
+private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, onBack: (() -> Unit)?, onLogout: (() -> Unit)?, onPost: (Post) -> Unit, onReply: (Post) -> Unit, onQuote: (Post) -> Unit, onRekarot: (Post, Boolean) -> Unit, onLike: (Post, Boolean) -> Unit, onBookmark: (Post, Boolean) -> Unit, onCompose: (() -> Unit)? = null, onUser: ((ApiUser) -> Unit)? = null, viewerUserId: Long? = null, onDm: ((ApiUser) -> Unit)? = null, newOwnPost: Post? = null, onProfileReload: (() -> Unit)? = null, onEditProfile: (() -> Unit)? = null, retainedState: ProfilePageRetainedState? = null) {
     val bottomDockInset = bottomDockContentInset()
     val displayName = user.displayName.ifBlank { user.username }
     val username = user.username
@@ -11932,18 +12270,20 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
         add("メディア" to "media")
         if (isOwn || user.showLikedPosts || profileContentLocked) add("いいね" to "likes")
     }
-    var selectedKind by remember(user.id) { mutableStateOf("posts") }
+    val localPageState = remember(user.id) { ProfilePageRetainedState() }
+    val pageState = retainedState ?: localPageState
+    var selectedKind by pageState.selectedKind
     val profileTabMotion = rememberHorizontalTabMotion(
         profileTabs.indexOfFirst { it.second == selectedKind }.coerceAtLeast(0),
         user.id
     )
     var connectionKind by remember(user.id) { mutableStateOf<String?>(null) }
-    var userPosts by remember(user.id, selectedKind) { mutableStateOf<List<Post>>(emptyList()) }
-    var nextPage by remember(user.id, selectedKind) { mutableIntStateOf(1) }
-    var nextCursor by remember(user.id, selectedKind) { mutableStateOf<Long?>(null) }
-    var hasNext by remember(user.id, selectedKind) { mutableStateOf(true) }
-    var loadingMore by remember(user.id, selectedKind) { mutableStateOf(false) }
-    var refreshingProfile by remember(user.id, selectedKind) { mutableStateOf(false) }
+    var userPosts by pageState.userPosts
+    var nextPage by pageState.nextPage
+    var nextCursor by pageState.nextCursor
+    var hasNext by pageState.hasNext
+    var loadingMore by pageState.loadingMore
+    var refreshingProfile by pageState.refreshing
     var followBusy by remember(user.id) { mutableStateOf(false) }
     var confirmUnfollow by remember(user.id) { mutableStateOf(false) }
     var muted by remember(user.id, user.isMuted) { mutableStateOf(user.isMuted) }
@@ -11960,7 +12300,7 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
     var questionDialogOpen by remember(user.id) { mutableStateOf(false) }
     var profileMoreOpen by remember(user.id) { mutableStateOf(false) }
     var visibleFollowers by remember(user.id) { mutableIntStateOf(user.followersCount) }
-    val listState = rememberLazyListState()
+    val listState = pageState.listState
     val profileScope = rememberCoroutineScope()
     val profileActionSize = 36.dp
     suspend fun loadPage() {
@@ -12056,7 +12396,9 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
         }
     }
     LaunchedEffect(user.id, selectedKind, profileContentLocked) {
+        if (pageState.loadedKind.value == selectedKind) return@LaunchedEffect
         userPosts = emptyList(); nextPage = 1; nextCursor = null; hasNext = true; loadingMore = false
+        pageState.loadedKind.value = selectedKind
         listState.scrollToItem(0)
         if (profileContentLocked) {
             hasNext = false
@@ -12676,12 +13018,10 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
                         .alpha(profileTabMotion.alpha)
                 ) {
                     row.forEach { (post, media) ->
-                        AsyncImage(
-                            model = media.url,
-                            contentDescription = media.alt.ifBlank { "投稿画像" },
-                            modifier = Modifier.weight(1f).fillMaxHeight().padding(1.dp)
-                                .clip(RoundedCornerShape(3.dp)).background(Hairline)
-                                .clickable {
+                        SpoilerAwareMediaThumbnail(
+                            media = media,
+                            modifier = Modifier.weight(1f).fillMaxHeight().padding(1.dp),
+                            onOpen = {
                                     profileScope.launch {
                                         val opened = post.id?.let { postId ->
                                             when (val result = withContext(Dispatchers.IO) { api.post(postId) }) {
@@ -12691,8 +13031,7 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
                                         } ?: post
                                         onPost(opened)
                                     }
-                                },
-                            contentScale = ContentScale.Crop
+                                }
                         )
                     }
                     repeat(3 - row.size) { Spacer(Modifier.weight(1f).fillMaxHeight().padding(1.dp)) }
@@ -13106,6 +13445,7 @@ private fun RowScope.DockItem(section: Section, selected: Boolean, hasBadge: Boo
 private fun EditPostDialog(
     post: Post,
     api: KarotterApi,
+    characterLimit: Int,
     onDismiss: () -> Unit,
     onUpdated: (Post) -> Unit
 ) {
@@ -13114,7 +13454,8 @@ private fun EditPostDialog(
     var error by remember(post.id) { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     val changed = content.trim() != post.text.trim()
-    val canSave = content.isNotBlank() && content.length <= 200 && changed && !saving
+    val effectiveCharacterLimit = characterLimit.coerceAtLeast(1)
+    val canSave = content.isNotBlank() && content.length <= effectiveCharacterLimit && changed && !saving
     Dialog(
         onDismissRequest = { if (!saving) onDismiss() },
         properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -13177,7 +13518,7 @@ private fun EditPostDialog(
             Column(Modifier.fillMaxSize().padding(22.dp)) {
                 BasicTextField(
                     value = content,
-                    onValueChange = { content = it.take(200); error = null },
+                    onValueChange = { content = it.take(effectiveCharacterLimit); error = null },
                     textStyle = TextStyle(Ink, 19.sp, FontWeight.Medium, lineHeight = 29.sp),
                     cursorBrush = androidx.compose.ui.graphics.SolidColor(Carrot),
                     modifier = Modifier.fillMaxWidth().weight(1f)
@@ -13189,7 +13530,12 @@ private fun EditPostDialog(
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     KText("投稿文字数", 10, Muted, FontWeight.Bold)
                     Spacer(Modifier.weight(1f))
-                    KText("${content.length} / 200", 12, if (content.length >= 180) Carrot else Ink, FontWeight.Black)
+                    KText(
+                        "${content.length} / $effectiveCharacterLimit",
+                        12,
+                        if (content.length >= effectiveCharacterLimit - 20) Carrot else Ink,
+                        FontWeight.Black
+                    )
                 }
             }
         }
@@ -13546,11 +13892,12 @@ private fun Composer(
             }
         }
     }
-    val postCharacterLimit = 200
+    val postCharacterLimit = currentUser?.postCharacterLimit?.coerceAtLeast(1) ?: 200
     val remaining = postCharacterLimit - text.length
     val validPollOptions = pollOptions.map(String::trim).filter(String::isNotBlank)
     val pollValid = !pollEnabled || validPollOptions.size >= 2
-    val canSubmit = text.isNotBlank() && remaining >= 0 && pollValid && !sending
+    val hasPostBody = text.isNotBlank() || selectedMedia.isNotEmpty()
+    val canSubmit = hasPostBody && remaining >= 0 && pollValid && !sending
     LaunchedEffect(Unit) {
         val circleResult = withContext(Dispatchers.IO) { api.circles() }
         if (circleResult is ApiResult.Success) circles = circleResult.value

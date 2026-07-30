@@ -16,7 +16,11 @@ private const val DM_API_BASE = "https://api.karotter.com/api/dm/"
 private const val NETWORK_UNAVAILABLE_STATUS = -1
 private const val CLIENT_DEVICE_NAME = "Karoha"
 private const val SUPPRESSED_NOTIFICATION_POST_TEXT = "受信停止は @Fantalia をフォロー！"
+private const val SUPPRESSED_QUESTION_ONLY_TEXT = "ozeu"
 const val MEDIA_BASE = "https://karotter.com"
+
+private fun String.isSuppressedQuestionSpam(): Boolean =
+    trim().equals(SUPPRESSED_QUESTION_ONLY_TEXT, ignoreCase = true)
 
 data class ApiUser(
     val id: Long,
@@ -70,7 +74,8 @@ data class ApiUser(
     val profileMaximumAge: Int? = null,
     val hideProfileFromMinors: Boolean = false,
     val profileUnavailableReason: String? = null,
-    val profileUnavailableDetails: List<String> = emptyList()
+    val profileUnavailableDetails: List<String> = emptyList(),
+    val postCharacterLimit: Int = 200
 )
 
 data class ApiMedia(
@@ -1274,10 +1279,12 @@ class KarotterApi(context: Context) {
             buildList {
                 for (index in 0 until array.length()) {
                     val item = array.optJSONObject(index) ?: continue
+                    val content = item.optString("content")
+                    if (content.isSuppressedQuestionSpam()) continue
                     add(
                         ApiQuestion(
                             id = item.optLong("id"),
-                            content = item.optString("content"),
+                            content = content,
                             createdAt = item.optString("createdAt"),
                             sender = item.optJSONObject("sender")?.let { sender ->
                                 runCatching { parseUser(sender) }.getOrNull()
@@ -1490,7 +1497,27 @@ class KarotterApi(context: Context) {
         }
 
         return notification.optJSONObject("post")?.hasSuppressedText() == true ||
-            notification.optJSONArray("posts")?.hasSuppressedText() == true
+            notification.optJSONArray("posts")?.hasSuppressedText() == true ||
+            notification.hasSuppressedQuestionSpam()
+    }
+
+    private fun JSONObject.hasSuppressedQuestionSpam(): Boolean {
+        val notificationType = optString("type").uppercase()
+        val question = optJSONObject("question")
+        val metadata = optJSONObject("metadata")
+        val hasQuestionShape = "QUESTION" in notificationType ||
+            question != null ||
+            has("questionContent") ||
+            metadata?.has("questionContent") == true ||
+            metadata?.has("question") == true
+        if (!hasQuestionShape) return false
+        if (optString("questionContent").isSuppressedQuestionSpam()) return true
+        if (question?.optString("content").orEmpty().isSuppressedQuestionSpam()) return true
+        if (metadata?.optString("questionContent").orEmpty().isSuppressedQuestionSpam()) return true
+        if (metadata?.optString("content").orEmpty().isSuppressedQuestionSpam()) return true
+        if (metadata?.optJSONObject("question")?.optString("content").orEmpty().isSuppressedQuestionSpam()) return true
+        return optString("content").isSuppressedQuestionSpam() ||
+            optString("message").isSuppressedQuestionSpam()
     }
 
     private fun isSuppressedSpamPost(post: ApiPost): Boolean =
@@ -2564,7 +2591,22 @@ class KarotterApi(context: Context) {
             json.optNullableInt("profileMaximumAge"),
             json.optBoolean("hideProfileFromMinors"),
             json.optString("profileUnavailableReason").takeIf { it.isNotBlank() && it != "null" },
-            profileUnavailableDetails
+            profileUnavailableDetails,
+            sequenceOf("postCharacterLimit", "maxPostLength", "postContentLimit", "characterLimit")
+                .mapNotNull { key ->
+                    if (!json.has(key) || json.isNull(key)) null
+                    else when (val value = json.opt(key)) {
+                        is Number -> value.toInt()
+                        is String -> value.toIntOrNull()
+                        else -> null
+                    }
+                }
+                .firstOrNull { it > 0 }
+                ?: when (json.optString("subscriptionPlan", "FREE").uppercase()) {
+                    "PRO" -> 1000
+                    "PLUS" -> 500
+                    else -> 200
+                }
         )
     }
 
