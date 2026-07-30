@@ -165,7 +165,10 @@ class BackgroundNotificationService : Service() {
 
         val result = api.notificationPage(1, 20)
         when (result) {
-            is ApiResult.Success -> deliverNew(activeIdentifier, result.value)
+            is ApiResult.Success -> deliverNew(
+                activeIdentifier,
+                result.value.filterNot(ApiNotification::suppressed)
+            )
             is ApiResult.Failure -> {
                 // KarotterApi already performs refresh -> recorded-session resume
                 // -> one final login for authentication failures. Temporary server

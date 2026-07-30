@@ -15,6 +15,7 @@ private const val API_BASE = "https://api.karotter.com/api/"
 private const val DM_API_BASE = "https://api.karotter.com/api/dm/"
 private const val NETWORK_UNAVAILABLE_STATUS = -1
 private const val CLIENT_DEVICE_NAME = "Karoha"
+private const val SUPPRESSED_NOTIFICATION_POST_TEXT = "受信停止は @Fantalia をフォロー！"
 const val MEDIA_BASE = "https://karotter.com"
 
 data class ApiUser(
@@ -192,7 +193,10 @@ data class ApiNotification(
     val message: String,
     val createdAt: String,
     val post: ApiPost?,
-    val actorUsername: String? = null
+    val actorUsername: String? = null,
+    val suppressed: Boolean = false,
+    val isRead: Boolean = false,
+    val notificationCount: Int = 1
 )
 data class ApiQuestion(
     val id: Long,
@@ -1106,6 +1110,7 @@ class KarotterApi(context: Context) {
 
     fun replies(id: Long): ApiResult<List<ApiPost>> = mapObject(request("posts/$id/replies?limit=100")) { root ->
         parsePosts(root.optJSONArray("replies") ?: root.optJSONArray("posts"))
+            .filterNot(::isSuppressedSpamPost)
     }
 
     fun postLikes(id: Long, page: Int = 1, limit: Int = 30): ApiResult<ApiUserPage> =
@@ -1223,14 +1228,15 @@ class KarotterApi(context: Context) {
                 request("https://api.karotter.com/api/users/$userId/replies?page=$page&limit=$limit")
             } else request("users/$userId/${kind.takeIf { it in setOf("posts", "media", "likes") } ?: "posts"}?page=$page&limit=$limit${cursor?.let { "&cursor=$it" }.orEmpty()}")
         ) { root ->
-            val posts = if (root.optJSONArray("posts") != null || root.optJSONArray("replies") != null) {
+            val parsedPosts = if (root.optJSONArray("posts") != null || root.optJSONArray("replies") != null) {
                 parsePosts(root.optJSONArray("posts") ?: root.optJSONArray("replies"))
             } else {
                 val bookmarks = root.optJSONArray("bookmarks") ?: JSONArray()
                 buildList { for (i in 0 until bookmarks.length()) bookmarks.optJSONObject(i)?.let { item -> runCatching { parsePost(item.optJSONObject("post") ?: item) }.getOrNull()?.let(::add) } }
             }
+            val posts = if (kind == "replies") parsedPosts.filterNot(::isSuppressedSpamPost) else parsedPosts
             val pagination = root.optJSONObject("pagination")
-            val hasNext = pagination?.optBoolean("hasNext", posts.size >= limit) ?: (posts.size >= limit)
+            val hasNext = pagination?.optBoolean("hasNext", parsedPosts.size >= limit) ?: (parsedPosts.size >= limit)
             ApiPostPage(posts, if (hasNext) page + 1 else null, posts.lastOrNull()?.id, hasNext)
         }
         return pageResult
@@ -1433,7 +1439,7 @@ class KarotterApi(context: Context) {
     fun markDmRead(groupId: Long): ApiResult<Unit> = mapObject(request("${DM_API_BASE}groups/$groupId/read", "POST", "{}", needsCsrf = true)) { Unit }
 
     fun notifications(limit: Int = 30): ApiResult<List<ApiNotification>> = mapObject(request("notifications?limit=${limit.coerceIn(1, 1000)}")) { root ->
-        parseNotifications(root)
+        parseNotifications(root).filterNot(ApiNotification::suppressed)
     }
 
     fun notificationPage(page: Int, limit: Int = 30, types: String? = null): ApiResult<List<ApiNotification>> = mapObject(
@@ -1456,19 +1462,56 @@ class KarotterApi(context: Context) {
                 val postJson = n.optJSONObject("post") ?: n.optJSONArray("posts")?.optJSONObject(0)
                 val actorName = actor?.optString("displayName", actor.optString("username"))?.takeIf { it.isNotBlank() } ?: "Karotter"
                 val type = n.optString("type", "SYSTEM")
+                val notificationIds = n.optJSONArray("notificationIds")
                 add(ApiNotification(
                     n.optString("id", n.optJSONArray("notificationIds")?.optString(0).orEmpty()), type, actorName,
                     absolute(actor?.optString("avatarUrl")),
                     n.optString("message").takeIf { it.isNotBlank() && it != "null" } ?: notificationMessage(type, actorName, n.optInt("actorCount", 1)),
                     n.optString("createdAt"),
                     postJson?.let { runCatching { parsePost(it) }.getOrNull() },
-                    actor?.optString("username")?.takeIf { it.isNotBlank() && it != "null" }
+                    actor?.optString("username")?.takeIf { it.isNotBlank() && it != "null" },
+                    suppressed = shouldSuppressNotification(n),
+                    isRead = n.optBoolean("isRead", false),
+                    notificationCount = notificationIds?.length()?.takeIf { it > 0 } ?: 1
                 ))
             }
         }
     }
 
-    fun unreadCount(): ApiResult<Int> = mapObject(request("notifications/unread/count")) { it.optInt("count") }
+    private fun shouldSuppressNotification(notification: JSONObject): Boolean {
+        fun JSONObject.hasSuppressedText(): Boolean =
+            optString("content").contains(SUPPRESSED_NOTIFICATION_POST_TEXT)
+
+        fun JSONArray.hasSuppressedText(): Boolean {
+            for (index in 0 until length()) {
+                if (optJSONObject(index)?.hasSuppressedText() == true) return true
+            }
+            return false
+        }
+
+        return notification.optJSONObject("post")?.hasSuppressedText() == true ||
+            notification.optJSONArray("posts")?.hasSuppressedText() == true
+    }
+
+    private fun isSuppressedSpamPost(post: ApiPost): Boolean =
+        post.content.contains(SUPPRESSED_NOTIFICATION_POST_TEXT)
+
+    fun unreadCount(): ApiResult<Int> {
+        val serverCount = when (val result = request("notifications/unread/count")) {
+            is ApiResult.Success -> result.value.optInt("count")
+            is ApiResult.Failure -> return result
+        }
+        if (serverCount <= 0) return ApiResult.Success(0)
+        val recentNotifications = when (val result = request("notifications?page=1&limit=100")) {
+            is ApiResult.Success -> parseNotifications(result.value)
+            is ApiResult.Failure -> return ApiResult.Success(serverCount)
+        }
+        val suppressedUnreadCount = recentNotifications
+            .asSequence()
+            .filter { it.suppressed && !it.isRead }
+            .sumOf(ApiNotification::notificationCount)
+        return ApiResult.Success((serverCount - suppressedUnreadCount).coerceAtLeast(0))
+    }
 
     fun markNotificationsRead(): ApiResult<Unit> = mapObject(request("notifications/read-all", "PATCH", "{}", needsCsrf = true)) { Unit }
 

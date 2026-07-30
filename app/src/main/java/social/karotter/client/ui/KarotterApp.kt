@@ -1275,7 +1275,7 @@ private fun MainShell(
             if (AppVisibility.isForeground) {
                 when (val result = withContext(Dispatchers.IO) { api.notificationPage(1, 20) }) {
                     is ApiResult.Success -> {
-                        val newest = result.value.firstOrNull()
+                        val newest = result.value.firstOrNull { !it.suppressed }
                         val newestKey = newest?.let { "${it.id}:${it.type}:${it.createdAt}" }
                         if (
                             lastNotificationKey != null &&
@@ -8255,15 +8255,21 @@ private fun NotificationsScreen(api: KarotterApi, onBack: () -> Unit, onPost: (P
         }) {
             is ApiResult.Success -> {
                 if (revision != requestRevision || requestedType != selectedType) return
-                val pageItems = result.value.distinctBy(::notificationKey)
+                val rawPageItems = result.value.distinctBy(::notificationKey)
+                val pageItems = rawPageItems.filterNot(ApiNotification::suppressed)
                 val existing = notifications.mapTo(hashSetOf(), ::notificationKey)
                 val additions = pageItems.filter { notificationKey(it) !in existing }
                 notifications = (notifications + additions).distinctBy(::notificationKey)
                 nextPage = requestedPage + 1
                 // Notifications can be grouped by the server, so a page may contain fewer
                 // items than the requested limit even when another page exists.
-                hasMore = pageItems.isNotEmpty() && additions.isNotEmpty()
+                hasMore = rawPageItems.isNotEmpty()
                 error = null
+                if (pageItems.isEmpty() && rawPageItems.isNotEmpty()) {
+                    loading = false
+                    loadNextPage()
+                    return
+                }
             }
             is ApiResult.Failure -> {
                 if (revision != requestRevision || requestedType != selectedType) return
