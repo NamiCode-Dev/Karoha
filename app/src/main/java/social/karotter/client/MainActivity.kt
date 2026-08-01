@@ -5,6 +5,7 @@ import android.content.Intent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.core.app.NotificationManagerCompat
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -58,17 +59,21 @@ class MainActivity : ComponentActivity() {
         val postId = intent?.getLongExtra(EXTRA_NOTIFICATION_POST_ID, -1L)?.takeIf { it > 0L }
         val username = intent?.getStringExtra(EXTRA_NOTIFICATION_USERNAME)?.takeIf { it.isNotBlank() }
         val dmGroupId = intent?.getLongExtra(EXTRA_NOTIFICATION_DM_GROUP_ID, -1L)?.takeIf { it > 0L }
+        val systemNotificationId = intent?.getIntExtra(EXTRA_SYSTEM_NOTIFICATION_ID, -1)?.takeIf { it >= 0 }
+        systemNotificationId?.let { NotificationManagerCompat.from(this).cancel(it) }
         if (postId != null || username != null || dmGroupId != null) {
             notificationTarget = NotificationNavigationTarget(postId, username, dmGroupId)
             intent?.removeExtra(EXTRA_NOTIFICATION_POST_ID)
             intent?.removeExtra(EXTRA_NOTIFICATION_USERNAME)
             intent?.removeExtra(EXTRA_NOTIFICATION_DM_GROUP_ID)
         }
+        intent?.removeExtra(EXTRA_SYSTEM_NOTIFICATION_ID)
     }
 
     companion object {
         const val EXTRA_NOTIFICATION_POST_ID = "karoha.notification.POST_ID"
         const val EXTRA_NOTIFICATION_USERNAME = "karoha.notification.USERNAME"
         const val EXTRA_NOTIFICATION_DM_GROUP_ID = "karoha.notification.DM_GROUP_ID"
+        const val EXTRA_SYSTEM_NOTIFICATION_ID = "karoha.notification.SYSTEM_NOTIFICATION_ID"
     }
 }

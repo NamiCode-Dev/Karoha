@@ -237,7 +237,9 @@ import com.adamglin.phosphoricons.regular.CaretDown
 import com.adamglin.phosphoricons.regular.CaretUp
 import com.adamglin.phosphoricons.regular.ChatCircle
 import com.adamglin.phosphoricons.regular.Check
+import com.adamglin.phosphoricons.regular.ClockCounterClockwise
 import com.adamglin.phosphoricons.regular.DotsThreeVertical
+import com.adamglin.phosphoricons.regular.DownloadSimple
 import com.adamglin.phosphoricons.regular.EnvelopeSimple
 import com.adamglin.phosphoricons.regular.Eye as RegularEye
 import com.adamglin.phosphoricons.regular.Heart as RegularHeart
@@ -260,13 +262,17 @@ import com.adamglin.phosphoricons.regular.SealCheck
 import com.adamglin.phosphoricons.regular.ShareNetwork
 import com.adamglin.phosphoricons.regular.SignOut
 import com.adamglin.phosphoricons.regular.SlidersHorizontal
+import com.adamglin.phosphoricons.regular.Smiley
+import com.adamglin.phosphoricons.regular.Sparkle
 import com.adamglin.phosphoricons.regular.SpeakerHigh
 import com.adamglin.phosphoricons.regular.SpeakerSlash
 import com.adamglin.phosphoricons.regular.Trash
+import com.adamglin.phosphoricons.regular.TrendUp
 import com.adamglin.phosphoricons.regular.Trophy
 import com.adamglin.phosphoricons.regular.User as RegularUser
 import com.adamglin.phosphoricons.regular.UserCircleGear
 import com.adamglin.phosphoricons.regular.UserSwitch
+import com.adamglin.phosphoricons.regular.UserCheck
 import com.adamglin.phosphoricons.regular.UsersThree
 import com.adamglin.phosphoricons.regular.Info
 import com.adamglin.phosphoricons.regular.X
@@ -400,7 +406,8 @@ private val LocalViewerIsPro = staticCompositionLocalOf { false }
 private data class RekarotState(val rekaroted: Boolean, val count: Int)
 private data class PostInteractionState(
     val liked: Boolean? = null,
-    val bookmarked: Boolean? = null
+    val bookmarked: Boolean? = null,
+    val reactions: Map<String, Boolean> = emptyMap()
 )
 
 private data class HorizontalTabMotion(val shiftDp: Float, val alpha: Float)
@@ -1203,6 +1210,11 @@ private fun MainShell(
 
     fun pushOverlay(next: Overlay) { overlayStack = overlayStack + next }
     fun popOverlay() { overlayStack = overlayStack.dropLast(1) }
+    fun openNotifications() {
+        unreadCount = 0
+        BackgroundNotificationManager.clearEventNotifications(context)
+        pushOverlay(Overlay.Notifications())
+    }
     fun selectSection(next: Section) {
         overlayStack = emptyList()
         if (next != section) {
@@ -1257,21 +1269,15 @@ private fun MainShell(
         val refreshed = uniqueTimelinePosts(incoming)
         val refreshedById = refreshed.mapNotNull { post -> post.id?.let { it to post } }.toMap()
         refreshedById.forEach { (postId, freshPost) ->
-            postInteractionStates[postId]?.let { pending ->
-                val reconciled = pending.copy(
-                    liked = pending.liked?.takeUnless { it == freshPost.initiallyLiked },
-                    bookmarked = pending.bookmarked?.takeUnless { it == freshPost.initiallyBookmarked }
-                )
-                if (reconciled.liked == null && reconciled.bookmarked == null) {
-                    postInteractionStates.remove(postId)
-                } else {
-                    postInteractionStates[postId] = reconciled
-                }
-            }
             rekarotStates[postId]?.let { pending ->
-                if (pending.rekaroted == freshPost.initiallyRekaroted) {
-                    rekarotStates.remove(postId)
-                }
+                val correctedCount = (
+                    freshPost.rekarots + when {
+                        pending.rekaroted && !freshPost.initiallyRekaroted -> 1
+                        !pending.rekaroted && freshPost.initiallyRekaroted -> -1
+                        else -> 0
+                    }
+                ).coerceAtLeast(0)
+                rekarotStates[postId] = pending.copy(count = correctedCount)
             }
         }
         val existingIds = posts.mapNotNullTo(hashSetOf()) { it.id }
@@ -1612,9 +1618,18 @@ private fun MainShell(
     }
 
     fun react(post: Post, emoji: String, desired: Boolean) {
+        val postId = post.id ?: return
+        val previous = postInteractionStates[postId]
+        postInteractionStates[postId] = (previous ?: PostInteractionState()).copy(
+            reactions = previous?.reactions.orEmpty() + (emoji to desired)
+        )
         scope.launch {
-            val result = withContext(Dispatchers.IO) { api.react(post.id ?: return@withContext ApiResult.Failure("投稿IDがありません"), emoji, desired) }
-            if (result is ApiResult.Failure) error = result.message
+            val result = withContext(Dispatchers.IO) { api.react(postId, emoji, desired) }
+            if (result is ApiResult.Failure) {
+                if (previous == null) postInteractionStates.remove(postId)
+                else postInteractionStates[postId] = previous
+                error = result.message
+            }
         }
     }
 
@@ -1748,7 +1763,7 @@ private fun MainShell(
                     },
                     onLoadMore = ::loadMoreHome,
                     unreadCount = unreadCount,
-                    onNotifications = { unreadCount = 0; pushOverlay(Overlay.Notifications()) },
+                    onNotifications = ::openNotifications,
                     onCreateStory = { storyCreatorOpen = true },
                     onStory = ::openStory,
                     onOpen = { pushOverlay(Overlay.PostDetail(it)) },
@@ -1787,7 +1802,7 @@ private fun MainShell(
                     onConversationState = { dmConversationOpen = it },
                     onUnreadCountChanged = { dmUnreadCount = it }
                 )
-                Section.PROFILE -> MyPageScreen(currentUser, api, themeKey, followsSystemTheme, onThemeChange, onLogout, onAccountChanged, onAddAccount, { unreadCount = 0; pushOverlay(Overlay.Notifications()) }, { pushOverlay(Overlay.PostDetail(it)) }, { openComposer(parent = it) }, { openComposer(quote = it) }, ::rekarot, ::like, ::bookmark, { openComposer() }, { openComposer(question = it) }, latestCreatedPost) { pushOverlay(Overlay.UserDetail(it.toProfilePost())) }
+                Section.PROFILE -> MyPageScreen(currentUser, api, themeKey, followsSystemTheme, onThemeChange, onLogout, onAccountChanged, onAddAccount, ::openNotifications, { pushOverlay(Overlay.PostDetail(it)) }, { openComposer(parent = it) }, { openComposer(quote = it) }, ::rekarot, ::like, ::bookmark, { openComposer() }, { openComposer(question = it) }, latestCreatedPost) { pushOverlay(Overlay.UserDetail(it.toProfilePost())) }
                 }
             }
         }
@@ -1958,7 +1973,7 @@ private fun MainShell(
                         when {
                             notification.type.equals("DM", ignoreCase = true) -> selectSection(Section.DM)
                             notification.post != null -> pushOverlay(Overlay.PostDetail(notification.post.toUiPost()))
-                            else -> pushOverlay(Overlay.Notifications())
+                            else -> openNotifications()
                         }
                     },
                     onDismiss = { notificationToastVisible = false }
@@ -2536,7 +2551,7 @@ private fun AppUpdateDialog(
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
         Column(
-            Modifier.fillMaxWidth().padding(horizontal = 18.dp).navigationBarsPadding()
+            Modifier.fillMaxWidth().fillMaxHeight(.88f).padding(horizontal = 18.dp).navigationBarsPadding()
                 .clip(RoundedCornerShape(28.dp)).background(Paper)
                 .border(1.dp, Hairline, RoundedCornerShape(28.dp)).padding(22.dp)
         ) {
@@ -2551,10 +2566,12 @@ private fun AppUpdateDialog(
             }
             Spacer(Modifier.height(19.dp))
             Box(
-                Modifier.fillMaxWidth().background(Surface, RoundedCornerShape(18.dp))
-                    .border(1.dp, Hairline, RoundedCornerShape(18.dp)).padding(15.dp)
+                Modifier.fillMaxWidth().weight(1f).clip(RoundedCornerShape(18.dp))
+                    .background(Surface).border(1.dp, Hairline, RoundedCornerShape(18.dp))
             ) {
-                Column {
+                Column(
+                    Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(15.dp)
+                ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         KText(update.title.ifBlank { update.tagName }, 14, Ink, FontWeight.Black, modifier = Modifier.weight(1f))
                         if (update.apkSize > 0L) {
@@ -2563,7 +2580,7 @@ private fun AppUpdateDialog(
                     }
                     if (update.notes.isNotBlank()) {
                         Spacer(Modifier.height(9.dp))
-                        KText(update.notes, 10, Muted, lineHeight = 16f, maxLines = 5)
+                        RichContentText(update.notes, 10, Muted, lineHeight = 16f)
                     }
                 }
             }
@@ -2594,7 +2611,7 @@ private fun AppUpdateDialog(
                 contentAlignment = Alignment.Center
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    CustomIcon(IconType.SEND, OnStrong, 18.dp)
+                    CustomIcon(IconType.DOWNLOAD, OnStrong, 18.dp)
                     Spacer(Modifier.width(8.dp))
                     KText(if (error == null) "ダウンロードして更新" else "もう一度試す", 11, OnStrong, FontWeight.Black)
                 }
@@ -3649,9 +3666,6 @@ private fun PostCard(
     var localRekaroted by remember(post.id, post.initiallyRekaroted) { mutableStateOf(post.initiallyRekaroted) }
     var localBookmarked by remember(post.id, post.initiallyBookmarked) { mutableStateOf(post.initiallyBookmarked) }
     var reactions by remember(post.id) { mutableStateOf(post.reactions) }
-    var pendingReactionChanges by remember(post.id) {
-        mutableStateOf<Map<String, Boolean>>(emptyMap())
-    }
     var poll by remember(post.id) { mutableStateOf(post.poll) }
     var reactionPickerOpen by remember(post.id) { mutableStateOf(false) }
     var textExpanded by remember(post.id, post.text) { mutableStateOf(false) }
@@ -3683,13 +3697,8 @@ private fun PostCard(
     val cardAccent = post.cardAccentColor.toAppColor()?.takeIf {
         post.showCardDecoration && post.subscriptionStatus.equals("ACTIVE", true)
     }
-    LaunchedEffect(post.id, post.reactions) {
-        val unreconciled = pendingReactionChanges.filter { (emoji, desired) ->
-            val serverReacted = post.reactions.firstOrNull { it.emoji == emoji }?.reacted == true
-            serverReacted != desired
-        }
-        pendingReactionChanges = unreconciled
-        reactions = mergePendingReactions(post.reactions, unreconciled)
+    LaunchedEffect(post.id, post.reactions, sharedInteractionState?.reactions) {
+        reactions = mergePendingReactions(post.reactions, sharedInteractionState?.reactions.orEmpty())
     }
     if (hiddenByMenuAction) return
     if (postMenuOpen) {
@@ -3992,7 +4001,6 @@ private fun PostCard(
                         onReact = { emoji ->
                             val current = reactions.firstOrNull { it.emoji == emoji }
                             val desired = current?.reacted != true
-                            pendingReactionChanges = pendingReactionChanges + (emoji to desired)
                             reactions = if (current == null) {
                                 reactions + ApiReaction(emoji, 1, true)
                             } else {
@@ -5375,7 +5383,7 @@ private fun MediaAttachment(
                                 Modifier.size(40.dp).background(PaleCarrot, RoundedCornerShape(13.dp)),
                                 contentAlignment = Alignment.Center
                             ) {
-                                CustomIcon(IconType.IMAGE, Carrot, 19.dp)
+                                CustomIcon(IconType.DOWNLOAD, Carrot, 19.dp)
                             }
                             Spacer(Modifier.width(12.dp))
                             Column {
@@ -5940,11 +5948,11 @@ private fun CommunityScreen(
         }
         val joinedWithoutOwned = joined.filterNot { it.id in ownedIds }
         if (joinedWithoutOwned.isNotEmpty()) {
-            item { CommunitySectionTitle("参加中", "${joinedWithoutOwned.size}件のコミュニティ") }
+            item { CommunitySectionTitle("参加中", "${joinedWithoutOwned.size}件のコミュニティ", IconType.JOINED) }
             items(joinedWithoutOwned, key = { "joined-${it.id}" }) { CommunityListCard(it, true) { selected = it } }
         }
         if (recommended.isNotEmpty()) {
-            item { CommunitySectionTitle("おすすめ", "参加できるコミュニティ") }
+            item { CommunitySectionTitle("おすすめ", "参加できるコミュニティ", IconType.RECOMMENDED) }
             items(recommended, key = { "recommended-${it.id}" }) { CommunityListCard(it, false) { selected = it } }
         }
         if (!loading && error == null && owned.isEmpty() && joined.isEmpty() && recommended.isEmpty()) {
@@ -5965,10 +5973,21 @@ private fun CommunityScreen(
 }
 
 @Composable
-private fun CommunitySectionTitle(title: String, subtitle: String) {
-    Column(Modifier.padding(start = 22.dp, top = 18.dp, end = 22.dp, bottom = 8.dp)) {
-        KText(title, 13, Ink, FontWeight.Black)
-        KText(subtitle, 9, Muted)
+private fun CommunitySectionTitle(title: String, subtitle: String, icon: IconType? = null) {
+    Row(
+        Modifier.padding(start = 22.dp, top = 18.dp, end = 22.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (icon != null) {
+            Box(Modifier.size(32.dp).background(PaleCarrot, RoundedCornerShape(10.dp)), contentAlignment = Alignment.Center) {
+                CustomIcon(icon, Carrot, 17.dp)
+            }
+            Spacer(Modifier.width(10.dp))
+        }
+        Column {
+            KText(title, 13, Ink, FontWeight.Black)
+            KText(subtitle, 9, Muted)
+        }
     }
 }
 
@@ -6808,6 +6827,8 @@ private fun DiscoverScreen(api: KarotterApi, externalRequest: Pair<String, Long>
         if (historySuggestions.isNotEmpty()) {
             item {
                 Row(Modifier.fillMaxWidth().padding(start = 22.dp, top = 18.dp, end = 22.dp, bottom = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                    CustomIcon(if (query.isBlank()) IconType.HISTORY else IconType.SEARCH, Muted, 16.dp)
+                    Spacer(Modifier.width(8.dp))
                     KText(if (query.isBlank()) "最近の検索" else "検索候補", 11, Muted, FontWeight.Black, modifier = Modifier.weight(1f))
                     if (query.isBlank()) KText("端末に最大12件保存", 9, Muted)
                 }
@@ -6821,7 +6842,16 @@ private fun DiscoverScreen(api: KarotterApi, externalRequest: Pair<String, Long>
                 }
             }
         }
-        item { KText("いま、伸びている話題", 17, Ink, FontWeight.Bold, modifier = Modifier.padding(22.dp, 28.dp, 22.dp, 12.dp)) }
+        item {
+            Row(
+                Modifier.padding(22.dp, 28.dp, 22.dp, 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                CustomIcon(IconType.TREND, Carrot, 20.dp)
+                Spacer(Modifier.width(9.dp))
+                KText("いま、伸びている話題", 17, Ink, FontWeight.Bold)
+            }
+        }
         itemsIndexed(trends) { i, trend ->
             Row(Modifier.fillMaxWidth().clickable { submitSearch(trend.label) }.padding(horizontal = 22.dp, vertical = 13.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(37.dp).background(if (i == 0) Carrot else Hairline, CircleShape), contentAlignment = Alignment.Center) {
@@ -9121,7 +9151,8 @@ private fun NotificationsScreen(api: KarotterApi, retainedState: NotificationsRe
             items(notifications, key = ::notificationKey) { notice ->
                 val kind = notice.type.uppercase()
                 val accent = when (kind) {
-                    "LIKE", "REACTION" -> Color(0xFFE65772)
+                    "LIKE" -> Color(0xFFE65772)
+                    "REACTION" -> Color(0xFF8A5BD1)
                     "FOLLOW", "COMMUNITY_JOIN" -> Color(0xFF3D8B73)
                     "FOLLOW_REQUEST" -> Color(0xFFE0A12A)
                     "FOLLOWED_POST", "SYSTEM" -> Color(0xFF3979C9)
@@ -9150,7 +9181,8 @@ private fun NotificationsScreen(api: KarotterApi, retainedState: NotificationsRe
                         }
                         Box(Modifier.size(21.dp).align(Alignment.BottomEnd).background(accent, CircleShape).border(2.dp, Surface, CircleShape), contentAlignment = Alignment.Center) {
                             when (kind) {
-                                "LIKE", "REACTION" -> CustomIcon(IconType.HEART, Color.White, 11.dp, filled = true)
+                                "LIKE" -> CustomIcon(IconType.HEART, Color.White, 11.dp, filled = true)
+                                "REACTION" -> CustomIcon(IconType.REACTION, Color.White, 12.dp)
                                 "FOLLOW" -> CustomIcon(IconType.PERSON, Color.White, 11.dp, filled = true)
                                 "FOLLOW_REQUEST" -> CustomIcon(IconType.PERSON, Color.White, 11.dp)
                                 "FOLLOWED_POST" -> CustomIcon(IconType.BELL, Color.White, 11.dp)
@@ -12484,7 +12516,12 @@ private fun BookmarksScreen(
                     onQuote = onQuote,
                     onRekarot = { onRekarot(post, it) },
                     onLike = { onLike(post, it) },
-                    onBookmark = { onBookmark(post, it) }
+                    onBookmark = { desired ->
+                        if (!desired) {
+                            posts = posts.filterNot { listed -> postStableKey(listed) == postStableKey(post) }
+                        }
+                        onBookmark(post, desired)
+                    }
                 )
             }
             if (loading) item { LoadingPost() }
@@ -15363,7 +15400,7 @@ private enum class IconType {
     LOCK, PIN, POLL, CONTROLS, CALENDAR, REFRESH, CHEVRON_UP, CHEVRON_DOWN,
     PLUS, BACK, CLOSE, SEND, CHECK, REKAROT, FORWARD, EYE,
     THEME, LICENSE, INFO, LOGOUT, PROFILE_EDIT, ACCOUNT_SWITCH, VOLUME_ON, VOLUME_OFF, BLOCK, MORE, VERIFIED,
-    LINK, MAP_PIN, QUESTION, SHARE
+    LINK, MAP_PIN, QUESTION, SHARE, DOWNLOAD, REACTION, TREND, HISTORY, JOINED, RECOMMENDED
 }
 
 @Composable
@@ -15415,6 +15452,12 @@ private fun CustomIcon(type: IconType, color: Color, size: Dp, filled: Boolean =
         IconType.MAP_PIN -> PhosphorIcons.Regular.MapPin
         IconType.QUESTION -> PhosphorIcons.Regular.ChatCircle
         IconType.SHARE -> PhosphorIcons.Regular.ShareNetwork
+        IconType.DOWNLOAD -> PhosphorIcons.Regular.DownloadSimple
+        IconType.REACTION -> PhosphorIcons.Regular.Smiley
+        IconType.TREND -> PhosphorIcons.Regular.TrendUp
+        IconType.HISTORY -> PhosphorIcons.Regular.ClockCounterClockwise
+        IconType.JOINED -> PhosphorIcons.Regular.UserCheck
+        IconType.RECOMMENDED -> PhosphorIcons.Regular.Sparkle
     }
     Image(
         imageVector = vector,

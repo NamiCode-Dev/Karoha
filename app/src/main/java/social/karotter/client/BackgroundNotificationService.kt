@@ -2,16 +2,19 @@ package social.karotter.client
 
 import android.Manifest
 import android.app.Notification
+import android.app.AlarmManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
+import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -26,6 +29,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
 private const val NOTIFICATION_STATE_PREFS = "karoha_background_notification_state_v1"
+private const val EVENT_CHANNEL_ID = "karoha_social_events"
 
 private fun sharedNotificationKey(item: ApiNotification): String =
     "${item.id}:${item.type}:${item.actorName}:${item.createdAt}"
@@ -73,6 +77,7 @@ object BackgroundNotificationManager {
     private const val PREFS = "karoha_background_notifications_v1"
     private const val ENABLED = "enabled"
     private const val AUTH_PAUSED = "auth_paused"
+    private const val RESTART_REQUEST_CODE = 64115
 
     fun isEnabled(context: Context): Boolean =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(ENABLED, false)
@@ -84,7 +89,10 @@ object BackgroundNotificationManager {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean(ENABLED, enabled)
             .apply()
-        if (!enabled) context.stopService(Intent(context, BackgroundNotificationService::class.java))
+        if (!enabled) {
+            cancelScheduledRestart(context)
+            context.stopService(Intent(context, BackgroundNotificationService::class.java))
+        }
     }
 
     fun onLoginSucceeded(context: Context) {
@@ -117,25 +125,58 @@ object BackgroundNotificationManager {
             .apply()
     }
 
+    fun clearEventNotifications(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        val manager = context.getSystemService(NotificationManager::class.java)
+        manager.activeNotifications
+            .filter { it.notification.channelId == EVENT_CHANNEL_ID }
+            .forEach { manager.cancel(it.id) }
+    }
+
     internal fun pauseForAuthentication(context: Context) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean(AUTH_PAUSED, true)
             .apply()
+        cancelScheduledRestart(context)
     }
 
-    fun startIfNeeded(context: Context) {
+    internal fun scheduleRestart(context: Context, delayMillis: Long = 30_000L) {
+        if (!isEnabled(context) || isAuthPaused(context) || AppVisibility.isForeground) return
+        val alarm = context.getSystemService(AlarmManager::class.java)
+        alarm.setAndAllowWhileIdle(
+            AlarmManager.ELAPSED_REALTIME_WAKEUP,
+            SystemClock.elapsedRealtime() + delayMillis,
+            restartPendingIntent(context)
+        )
+    }
+
+    internal fun cancelScheduledRestart(context: Context) {
+        context.getSystemService(AlarmManager::class.java).cancel(restartPendingIntent(context))
+    }
+
+    private fun restartPendingIntent(context: Context): PendingIntent = PendingIntent.getBroadcast(
+        context,
+        RESTART_REQUEST_CODE,
+        Intent(context, BackgroundNotificationRestartReceiver::class.java)
+            .setAction("social.karotter.client.RESTART_BACKGROUND_NOTIFICATIONS"),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
+
+    fun startIfNeeded(context: Context, action: String? = null) {
         if (!isEnabled(context) || isAuthPaused(context) || AppVisibility.isForeground) return
         runCatching {
             ContextCompat.startForegroundService(
                 context,
-                Intent(context, BackgroundNotificationService::class.java)
+                Intent(context, BackgroundNotificationService::class.java).setAction(action)
             )
         }
     }
 }
 
 class BackgroundNotificationService : Service() {
-    private val executor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+    private val pollerLock = Any()
+    @Volatile private var executor: ScheduledExecutorService? = null
+    @Volatile private var lastPollFinishedAt = SystemClock.elapsedRealtime()
     private lateinit var api: KarotterApi
     private val state by lazy {
         getSharedPreferences(NOTIFICATION_STATE_PREFS, Context.MODE_PRIVATE)
@@ -160,7 +201,8 @@ class BackgroundNotificationService : Service() {
         } else {
             startForeground(MONITOR_NOTIFICATION_ID, monitor)
         }
-        executor.scheduleWithFixedDelay(::pollSafely, 0L, 15L, TimeUnit.SECONDS)
+        startPoller()
+        BackgroundNotificationManager.scheduleRestart(this, WATCHDOG_INTERVAL_MILLIS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -171,18 +213,51 @@ class BackgroundNotificationService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        if (intent?.action == ACTION_WATCHDOG &&
+            SystemClock.elapsedRealtime() - lastPollFinishedAt >= STALE_POLLER_MILLIS
+        ) {
+            startPoller(force = true)
+        }
+        BackgroundNotificationManager.scheduleRestart(this, WATCHDOG_INTERVAL_MILLIS)
         return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        BackgroundNotificationManager.scheduleRestart(this)
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
-        executor.shutdownNow()
+        synchronized(pollerLock) {
+            executor?.shutdownNow()
+            executor = null
+        }
+        BackgroundNotificationManager.scheduleRestart(this)
         super.onDestroy()
     }
 
+    private fun startPoller(force: Boolean = false) {
+        synchronized(pollerLock) {
+            if (force) {
+                executor?.shutdownNow()
+                executor = null
+            }
+            if (executor?.isShutdown == false && executor?.isTerminated == false) return
+            lastPollFinishedAt = SystemClock.elapsedRealtime()
+            executor = Executors.newSingleThreadScheduledExecutor().also { scheduler ->
+                scheduler.scheduleWithFixedDelay(::pollSafely, 0L, 15L, TimeUnit.SECONDS)
+            }
+        }
+    }
+
     private fun pollSafely() {
-        runCatching { poll() }
+        try {
+            runCatching { poll() }
+        } finally {
+            lastPollFinishedAt = SystemClock.elapsedRealtime()
+        }
     }
 
     private fun poll() {
@@ -234,18 +309,18 @@ class BackgroundNotificationService : Service() {
 
         val additions = notifications.takeWhile { sharedNotificationKey(it) != previousKey }.take(5)
         additions.asReversed().forEach { notification ->
-            val systemNotification = NotificationCompat.Builder(this, CHANNEL_EVENTS)
+            val notificationId = EVENT_NOTIFICATION_BASE + sharedNotificationKey(notification).hashCode().and(0x0FFFFFFF)
+            val systemNotification = NotificationCompat.Builder(this, EVENT_CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.stat_notify_more)
                 .setContentTitle(notification.actorName.ifBlank { "Karoha" })
                 .setContentText(notification.message)
                 .setStyle(NotificationCompat.BigTextStyle().bigText(notification.message))
-                .setContentIntent(openAppIntent(notification.post?.id, notification.actorUsername))
+                .setContentIntent(openAppIntent(notification.post?.id, notification.actorUsername, systemNotificationId = notificationId))
                 .setAutoCancel(true)
                 .setCategory(NotificationCompat.CATEGORY_SOCIAL)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .build()
-            NotificationManagerCompat.from(this)
-                .notify(EVENT_NOTIFICATION_BASE + sharedNotificationKey(notification).hashCode().and(0x0FFFFFFF), systemNotification)
+            NotificationManagerCompat.from(this).notify(notificationId, systemNotification)
         }
     }
 
@@ -262,6 +337,7 @@ class BackgroundNotificationService : Service() {
             .filter { previous[it.id] != sharedDmKey(it) }
             .take(5)
             .forEach { group ->
+                val notificationId = DM_NOTIFICATION_BASE + group.id.hashCode()
                 val title = group.name.ifBlank {
                     group.members.joinToString("、") { it.displayName.ifBlank { it.username } }
                         .ifBlank { "新しいメッセージ" }
@@ -269,17 +345,17 @@ class BackgroundNotificationService : Service() {
                 val message = group.lastMessage.ifBlank {
                     if (group.isRequest) "メッセージリクエストが届きました" else "画像が送信されました"
                 }
-                val systemNotification = NotificationCompat.Builder(this, CHANNEL_EVENTS)
+                val systemNotification = NotificationCompat.Builder(this, EVENT_CHANNEL_ID)
                     .setSmallIcon(android.R.drawable.stat_notify_chat)
                     .setContentTitle(title)
                     .setContentText(message)
                     .setStyle(NotificationCompat.BigTextStyle().bigText(message))
-                    .setContentIntent(openAppIntent(dmGroupId = group.id))
+                    .setContentIntent(openAppIntent(dmGroupId = group.id, systemNotificationId = notificationId))
                     .setAutoCancel(true)
                     .setCategory(NotificationCompat.CATEGORY_MESSAGE)
                     .setPriority(NotificationCompat.PRIORITY_HIGH)
                     .build()
-                NotificationManagerCompat.from(this).notify(DM_NOTIFICATION_BASE + group.id.hashCode(), systemNotification)
+                NotificationManagerCompat.from(this).notify(notificationId, systemNotification)
             }
     }
 
@@ -309,17 +385,23 @@ class BackgroundNotificationService : Service() {
             (Build.VERSION.SDK_INT < 33 ||
                 ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED)
 
-    private fun openAppIntent(postId: Long? = null, username: String? = null, dmGroupId: Long? = null): PendingIntent {
+    private fun openAppIntent(
+        postId: Long? = null,
+        username: String? = null,
+        dmGroupId: Long? = null,
+        systemNotificationId: Int? = null
+    ): PendingIntent {
         val intent = Intent(this, MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             .apply {
                 postId?.let { putExtra(MainActivity.EXTRA_NOTIFICATION_POST_ID, it) }
                 username?.let { putExtra(MainActivity.EXTRA_NOTIFICATION_USERNAME, it) }
                 dmGroupId?.let { putExtra(MainActivity.EXTRA_NOTIFICATION_DM_GROUP_ID, it) }
+                systemNotificationId?.let { putExtra(MainActivity.EXTRA_SYSTEM_NOTIFICATION_ID, it) }
             }
         return PendingIntent.getActivity(
             this,
-            postId?.hashCode() ?: username?.hashCode() ?: dmGroupId?.hashCode() ?: 0,
+            systemNotificationId ?: postId?.hashCode() ?: username?.hashCode() ?: dmGroupId?.hashCode() ?: 0,
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
@@ -335,7 +417,7 @@ class BackgroundNotificationService : Service() {
             }
         )
         manager.createNotificationChannel(
-            NotificationChannel(CHANNEL_EVENTS, "新着通知", NotificationManager.IMPORTANCE_HIGH).apply {
+            NotificationChannel(EVENT_CHANNEL_ID, "新着通知", NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "いいね、返信、フォローなどの新着通知"
             }
         )
@@ -347,12 +429,25 @@ class BackgroundNotificationService : Service() {
     }
 
     companion object {
+        internal const val ACTION_WATCHDOG = "social.karotter.client.BACKGROUND_NOTIFICATION_WATCHDOG"
+        private const val WATCHDOG_INTERVAL_MILLIS = 90_000L
+        private const val STALE_POLLER_MILLIS = 180_000L
         private const val CHANNEL_MONITOR = "karoha_background_monitor"
-        private const val CHANNEL_EVENTS = "karoha_social_events"
         private const val CHANNEL_ERRORS = "karoha_auth_errors"
         private const val MONITOR_NOTIFICATION_ID = 61001
         private const val AUTH_ERROR_NOTIFICATION_ID = 61002
         private const val EVENT_NOTIFICATION_BASE = 62000
         private const val DM_NOTIFICATION_BASE = 63000
+    }
+}
+
+class BackgroundNotificationRestartReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        if (!BackgroundNotificationManager.isEnabled(context) ||
+            BackgroundNotificationManager.isAuthPaused(context)
+        ) return
+        // Keep a later fallback armed until the foreground service actually starts.
+        BackgroundNotificationManager.scheduleRestart(context, 5 * 60_000L)
+        BackgroundNotificationManager.startIfNeeded(context, BackgroundNotificationService.ACTION_WATCHDOG)
     }
 }
