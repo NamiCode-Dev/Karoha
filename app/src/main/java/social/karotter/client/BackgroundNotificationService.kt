@@ -15,6 +15,8 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import org.json.JSONObject
+import social.karotter.client.data.ApiDmGroup
 import social.karotter.client.data.ApiNotification
 import social.karotter.client.data.ApiResult
 import social.karotter.client.data.KarotterApi
@@ -28,12 +30,39 @@ private const val NOTIFICATION_STATE_PREFS = "karoha_background_notification_sta
 private fun sharedNotificationKey(item: ApiNotification): String =
     "${item.id}:${item.type}:${item.actorName}:${item.createdAt}"
 
+private fun sharedDmKey(item: ApiDmGroup): String =
+    "${item.id}:${item.lastMessageAt}:${item.lastMessage}:${item.unreadCount}:${item.isRequest}"
+
 private fun notificationStateKey(account: String): String {
     val digest = MessageDigest.getInstance("SHA-256")
         .digest(account.trim().lowercase().toByteArray())
         .take(8)
         .joinToString("") { "%02x".format(it) }
     return "last_$digest"
+}
+
+private fun dmStateKey(account: String): String =
+    notificationStateKey(account).replaceFirst("last_", "last_dm_")
+
+private fun dmUnreadSnapshot(groups: List<ApiDmGroup>): Map<Long, String> =
+    groups.asSequence()
+        .filter { it.unreadCount > 0 || it.isRequest }
+        .associate { it.id to sharedDmKey(it) }
+
+private fun encodeDmSnapshot(snapshot: Map<Long, String>): String = JSONObject().apply {
+    snapshot.forEach { (groupId, key) -> put(groupId.toString(), key) }
+}.toString()
+
+private fun decodeDmSnapshot(raw: String?): Map<Long, String> {
+    if (raw.isNullOrBlank()) return emptyMap()
+    return runCatching {
+        val json = JSONObject(raw)
+        buildMap {
+            json.keys().forEach { groupId ->
+                groupId.toLongOrNull()?.let { put(it, json.optString(groupId)) }
+            }
+        }
+    }.getOrDefault(emptyMap())
 }
 
 object AppVisibility {
@@ -77,6 +106,14 @@ object BackgroundNotificationManager {
         context.getSharedPreferences(NOTIFICATION_STATE_PREFS, Context.MODE_PRIVATE)
             .edit()
             .putString(notificationStateKey(account), sharedNotificationKey(notification))
+            .apply()
+    }
+
+    fun markForegroundDmSnapshot(context: Context, account: String?, groups: List<ApiDmGroup>) {
+        if (account.isNullOrBlank()) return
+        context.getSharedPreferences(NOTIFICATION_STATE_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(dmStateKey(account), encodeDmSnapshot(dmUnreadSnapshot(groups)))
             .apply()
     }
 
@@ -167,14 +204,23 @@ class BackgroundNotificationService : Service() {
         when (result) {
             is ApiResult.Success -> deliverNew(
                 activeIdentifier,
-                result.value.filterNot(ApiNotification::suppressed)
+                result.value.filter {
+                    !it.suppressed && !it.type.equals("DM", ignoreCase = true)
+                }
             )
             is ApiResult.Failure -> {
                 // KarotterApi already performs refresh -> recorded-session resume
                 // -> one final login for authentication failures. Temporary server
                 // and transport failures must not create another login session.
-                if (result.status == 401) authenticationFailed(result.message)
+                if (result.status == 401) {
+                    authenticationFailed(result.message)
+                    return
+                }
             }
+        }
+        when (val dmResult = api.dmGroups()) {
+            is ApiResult.Success -> deliverNewDm(activeIdentifier, dmResult.value)
+            is ApiResult.Failure -> if (dmResult.status == 401) authenticationFailed(dmResult.message)
         }
     }
 
@@ -203,6 +249,40 @@ class BackgroundNotificationService : Service() {
         }
     }
 
+    private fun deliverNewDm(account: String, groups: List<ApiDmGroup>) {
+        val snapshot = dmUnreadSnapshot(groups)
+        val stateKey = dmStateKey(account)
+        val previousRaw = state.getString(stateKey, null)
+        val previous = decodeDmSnapshot(previousRaw)
+        state.edit().putString(stateKey, encodeDmSnapshot(snapshot)).apply()
+        if (previousRaw == null || AppVisibility.isForeground || !canPostNotifications()) return
+
+        groups.asSequence()
+            .filter { it.unreadCount > 0 || it.isRequest }
+            .filter { previous[it.id] != sharedDmKey(it) }
+            .take(5)
+            .forEach { group ->
+                val title = group.name.ifBlank {
+                    group.members.joinToString("、") { it.displayName.ifBlank { it.username } }
+                        .ifBlank { "新しいメッセージ" }
+                }
+                val message = group.lastMessage.ifBlank {
+                    if (group.isRequest) "メッセージリクエストが届きました" else "画像が送信されました"
+                }
+                val systemNotification = NotificationCompat.Builder(this, CHANNEL_EVENTS)
+                    .setSmallIcon(android.R.drawable.stat_notify_chat)
+                    .setContentTitle(title)
+                    .setContentText(message)
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+                    .setContentIntent(openAppIntent(dmGroupId = group.id))
+                    .setAutoCancel(true)
+                    .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .build()
+                NotificationManagerCompat.from(this).notify(DM_NOTIFICATION_BASE + group.id.hashCode(), systemNotification)
+            }
+    }
+
     private fun authenticationFailed(message: String) {
         if (!BackgroundNotificationManager.isAuthPaused(this) && canPostNotifications()) {
             val notification = NotificationCompat.Builder(this, CHANNEL_ERRORS)
@@ -229,16 +309,17 @@ class BackgroundNotificationService : Service() {
             (Build.VERSION.SDK_INT < 33 ||
                 ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED)
 
-    private fun openAppIntent(postId: Long? = null, username: String? = null): PendingIntent {
+    private fun openAppIntent(postId: Long? = null, username: String? = null, dmGroupId: Long? = null): PendingIntent {
         val intent = Intent(this, MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             .apply {
                 postId?.let { putExtra(MainActivity.EXTRA_NOTIFICATION_POST_ID, it) }
                 username?.let { putExtra(MainActivity.EXTRA_NOTIFICATION_USERNAME, it) }
+                dmGroupId?.let { putExtra(MainActivity.EXTRA_NOTIFICATION_DM_GROUP_ID, it) }
             }
         return PendingIntent.getActivity(
             this,
-            postId?.hashCode() ?: username?.hashCode() ?: 0,
+            postId?.hashCode() ?: username?.hashCode() ?: dmGroupId?.hashCode() ?: 0,
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
@@ -272,5 +353,6 @@ class BackgroundNotificationService : Service() {
         private const val MONITOR_NOTIFICATION_ID = 61001
         private const val AUTH_ERROR_NOTIFICATION_ID = 61002
         private const val EVENT_NOTIFICATION_BASE = 62000
+        private const val DM_NOTIFICATION_BASE = 63000
     }
 }

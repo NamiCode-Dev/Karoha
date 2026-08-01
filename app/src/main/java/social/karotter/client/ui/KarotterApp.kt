@@ -2,9 +2,15 @@ package social.karotter.client.ui
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Paint
 import android.graphics.drawable.Animatable as DrawableAnimatable
+import android.icu.lang.UCharacter
+import android.icu.lang.UProperty
 import android.media.MediaPlayer
 import android.content.Intent
 import android.net.ConnectivityManager
@@ -18,6 +24,8 @@ import android.provider.Settings
 import android.provider.OpenableColumns
 import android.text.Spannable
 import android.text.SpannableStringBuilder
+import android.text.Selection
+import android.text.TextPaint
 import android.text.TextUtils
 import android.text.method.LinkMovementMethod
 import android.text.style.ClickableSpan
@@ -60,6 +68,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
@@ -115,6 +124,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.TransformedText
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
@@ -143,6 +155,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
@@ -164,6 +177,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -190,7 +205,10 @@ import kotlinx.coroutines.flow.filter
 import coil.compose.AsyncImage
 import coil.compose.AsyncImagePainter
 import coil.imageLoader
+import java.net.HttpURLConnection
 import java.net.URL
+import org.json.JSONArray
+import org.json.JSONObject
 import io.noties.markwon.LinkResolver
 import io.noties.markwon.Markwon
 import io.noties.markwon.SoftBreakAddsNewLinePlugin
@@ -239,6 +257,7 @@ import com.adamglin.phosphoricons.regular.Repeat
 import com.adamglin.phosphoricons.regular.Robot
 import com.adamglin.phosphoricons.regular.Scroll
 import com.adamglin.phosphoricons.regular.SealCheck
+import com.adamglin.phosphoricons.regular.ShareNetwork
 import com.adamglin.phosphoricons.regular.SignOut
 import com.adamglin.phosphoricons.regular.SlidersHorizontal
 import com.adamglin.phosphoricons.regular.SpeakerHigh
@@ -251,6 +270,9 @@ import com.adamglin.phosphoricons.regular.UserSwitch
 import com.adamglin.phosphoricons.regular.UsersThree
 import com.adamglin.phosphoricons.regular.Info
 import com.adamglin.phosphoricons.regular.X
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.MultiFormatWriter
 import social.karotter.client.data.ApiBoard
 import social.karotter.client.data.ApiCircle
 import social.karotter.client.data.ApiCommunity
@@ -443,7 +465,12 @@ private data class ComposeTarget(
     val community: ApiCommunity? = null,
     val question: ApiQuestion? = null
 )
-private data class ComposerMedia(val uri: Uri, val name: String, val mimeType: String)
+private data class ComposerMedia(
+    val uri: Uri,
+    val name: String,
+    val mimeType: String,
+    val spoiler: Boolean = false
+)
 private data class ComposerSettings(
     val communityId: Long? = null,
     val visibility: String = "PUBLIC",
@@ -516,6 +543,65 @@ private data class Post(
     val canQuote: Boolean = true
 )
 
+private fun mergePendingReactions(
+    serverReactions: List<ApiReaction>,
+    pending: Map<String, Boolean>
+): List<ApiReaction> {
+    val merged = serverReactions.associateBy(ApiReaction::emoji).toMutableMap()
+    pending.forEach { (emoji, desired) ->
+        val current = merged[emoji]
+        if (desired) {
+            merged[emoji] = when {
+                current == null -> ApiReaction(emoji, 1, true)
+                current.reacted -> current
+                else -> current.copy(count = current.count + 1, reacted = true)
+            }
+        } else if (current != null) {
+            val nextCount = current.count - if (current.reacted) 1 else 0
+            if (nextCount <= 0) {
+                merged.remove(emoji)
+            } else {
+                merged[emoji] = current.copy(count = nextCount, reacted = false)
+            }
+        }
+    }
+    return merged.values.toList()
+}
+
+private fun postWebUrl(authorId: Long, postId: Long): String =
+    "https://karotter.com/$authorId/status/$postId"
+
+private fun profileWebUrl(username: String): String =
+    "https://karotter.com/profile/${Uri.encode(username.removePrefix("@"))}"
+
+private fun openShareMenu(context: Context, title: String, url: String) {
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, title)
+        putExtra(Intent.EXTRA_TEXT, url)
+    }
+    context.startActivity(Intent.createChooser(intent, title))
+}
+
+private fun generateQrCode(content: String, size: Int = 768) = runCatching {
+    val matrix = MultiFormatWriter().encode(
+        content,
+        BarcodeFormat.QR_CODE,
+        size,
+        size,
+        mapOf(EncodeHintType.MARGIN to 1)
+    )
+    val pixels = IntArray(size * size)
+    for (y in 0 until size) {
+        for (x in 0 until size) {
+            pixels[y * size + x] = if (matrix[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE
+        }
+    }
+    Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).apply {
+        setPixels(pixels, 0, size, 0, 0, size, size)
+    }.asImageBitmap()
+}.getOrNull()
+
 private class ProfilePageRetainedState {
     val selectedKind = mutableStateOf("posts")
     val userPosts = mutableStateOf<List<Post>>(emptyList())
@@ -553,6 +639,30 @@ private class NotificationsRetainedState {
 private fun postStableKey(post: Post): String =
     post.id?.let { "post:$it" }
         ?: "local:${post.authorId}:${post.createdAt}:${post.text.hashCode()}"
+
+private fun dmGroupNotificationKey(group: ApiDmGroup): String =
+    "${group.id}:${group.lastMessageAt}:${group.lastMessage}:${group.unreadCount}:${group.isRequest}"
+
+private fun dmGroupToastNotification(group: ApiDmGroup, currentUserId: Long?): ApiNotification {
+    val other = group.members.firstOrNull { it.id != currentUserId } ?: group.members.firstOrNull()
+    val title = group.name.ifBlank {
+        group.members.filter { it.id != currentUserId }
+            .joinToString("、") { it.displayName.ifBlank { it.username } }
+            .ifBlank { other?.displayName?.ifBlank { other.username } ?: "新しいメッセージ" }
+    }
+    return ApiNotification(
+        id = "dm-${group.id}-${group.lastMessageAt}",
+        type = "DM",
+        actorName = title,
+        actorAvatarUrl = other?.avatarUrl,
+        message = group.lastMessage.ifBlank {
+            if (group.isRequest) "メッセージリクエストが届きました" else "画像が送信されました"
+        },
+        createdAt = group.lastMessageAt.ifBlank { Instant.now().toString() },
+        post = null,
+        actorUsername = other?.username
+    )
+}
 
 private val PostUrlPattern = Regex("""https?://[^\s<>()\[\]{}]+""", RegexOption.IGNORE_CASE)
 
@@ -1051,6 +1161,7 @@ private fun MainShell(
     var notificationToast by remember { mutableStateOf<ApiNotification?>(null) }
     var notificationToastVisible by remember { mutableStateOf(false) }
     var dmUnreadCount by remember { mutableIntStateOf(0) }
+    var lastDmUnreadKeys by remember(currentUser?.id) { mutableStateOf<Map<Long, String>?>(null) }
     var loading by remember { mutableStateOf(true) }
     var refreshing by remember { mutableStateOf(false) }
     var homeLoadingMore by remember { mutableStateOf(false) }
@@ -1103,6 +1214,7 @@ private fun MainShell(
         val target = notificationTarget ?: return@LaunchedEffect
         try {
             when {
+                target.dmGroupId != null -> selectSection(Section.DM)
                 target.postId != null -> {
                     when (val result = withContext(Dispatchers.IO) { api.post(target.postId) }) {
                         is ApiResult.Success -> pushOverlay(Overlay.PostDetail(result.value.toUiPost()))
@@ -1314,12 +1426,15 @@ private fun MainShell(
     }
     LaunchedEffect(currentUser?.id, appResumed) {
         if (!appResumed) return@LaunchedEffect
+        lastDmUnreadKeys = null
         var lastNotificationKey: String? = null
         while (true) {
             if (AppVisibility.isForeground) {
                 when (val result = withContext(Dispatchers.IO) { api.notificationPage(1, 20) }) {
                     is ApiResult.Success -> {
-                        val newest = result.value.firstOrNull { !it.suppressed }
+                        val newest = result.value.firstOrNull {
+                            !it.suppressed && !it.type.equals("DM", ignoreCase = true)
+                        }
                         val newestKey = newest?.let { "${it.id}:${it.type}:${it.createdAt}" }
                         if (
                             lastNotificationKey != null &&
@@ -1342,18 +1457,34 @@ private fun MainShell(
                     is ApiResult.Success -> unreadCount = result.value
                     is ApiResult.Failure -> Unit
                 }
+                when (val result = withContext(Dispatchers.IO) { api.dmGroups() }) {
+                    is ApiResult.Success -> {
+                        val groups = result.value
+                        dmUnreadCount = groups.sumOf { it.unreadCount } +
+                            groups.count { it.isRequest && it.unreadCount == 0 }
+                        val unreadGroups = groups.filter { it.unreadCount > 0 || it.isRequest }
+                        val currentKeys = unreadGroups.associate { it.id to dmGroupNotificationKey(it) }
+                        val previousKeys = lastDmUnreadKeys
+                        if (previousKeys != null) {
+                            unreadGroups
+                                .filter { previousKeys[it.id] != dmGroupNotificationKey(it) }
+                                .maxByOrNull { it.lastMessageAt }
+                                ?.let { group ->
+                                    notificationToast = dmGroupToastNotification(group, currentUser?.id)
+                                    notificationToastVisible = true
+                                }
+                        }
+                        lastDmUnreadKeys = currentKeys
+                        BackgroundNotificationManager.markForegroundDmSnapshot(
+                            context,
+                            api.activeAccountIdentifier(),
+                            groups
+                        )
+                    }
+                    is ApiResult.Failure -> Unit
+                }
             }
             delay(10_000L)
-        }
-    }
-    LaunchedEffect(Unit) {
-        while (true) {
-            when (val result = withContext(Dispatchers.IO) { api.dmGroups() }) {
-                is ApiResult.Success -> dmUnreadCount =
-                    result.value.sumOf { it.unreadCount } + result.value.count { it.isRequest && it.unreadCount == 0 }
-                is ApiResult.Failure -> Unit
-            }
-            delay(5_000)
         }
     }
     LaunchedEffect(homeMode, homeRanking) {
@@ -1650,7 +1781,12 @@ private fun MainShell(
                     onCompose = { openComposer(community = it) },
                     latestCommunityPost = latestCommunityPost
                 )
-                Section.DM -> DmScreen(api, currentUser) { dmConversationOpen = it }
+                Section.DM -> DmScreen(
+                    api = api,
+                    currentUser = currentUser,
+                    onConversationState = { dmConversationOpen = it },
+                    onUnreadCountChanged = { dmUnreadCount = it }
+                )
                 Section.PROFILE -> MyPageScreen(currentUser, api, themeKey, followsSystemTheme, onThemeChange, onLogout, onAccountChanged, onAddAccount, { unreadCount = 0; pushOverlay(Overlay.Notifications()) }, { pushOverlay(Overlay.PostDetail(it)) }, { openComposer(parent = it) }, { openComposer(quote = it) }, ::rekarot, ::like, ::bookmark, { openComposer() }, { openComposer(question = it) }, latestCreatedPost) { pushOverlay(Overlay.UserDetail(it.toProfilePost())) }
                 }
             }
@@ -1685,7 +1821,7 @@ private fun MainShell(
             BottomDock(
                 selected = section,
                 bottomPadding = safe.calculateBottomPadding(),
-                dmHasUnread = dmUnreadCount > 0,
+                dmUnreadCount = dmUnreadCount,
                 hazeState = bottomDockHazeState,
                 onSelect = ::selectSection,
                 modifier = Modifier.align(Alignment.BottomCenter).zIndex(if (overlayKeepsBottomDock) 4f else 0f)
@@ -1737,6 +1873,7 @@ private fun MainShell(
 
         AnimatedVisibility(
             visible = composerOpen,
+            modifier = Modifier.fillMaxSize().zIndex(20f),
             enter = fadeIn(tween(180)) + scaleIn(spring(dampingRatio = .82f), initialScale = .92f),
             exit = fadeOut(tween(150)) + scaleOut(tween(180), targetScale = .96f)
         ) {
@@ -1755,7 +1892,7 @@ private fun MainShell(
                                 val uploads = selectedMedia.map { item ->
                                     val bytes = context.contentResolver.openInputStream(item.uri)?.use { it.readBytes() }
                                         ?: throw IllegalStateException("${item.name}を読み込めませんでした")
-                                    ApiUploadMedia(item.name, item.mimeType, bytes)
+                                    ApiUploadMedia(item.name, item.mimeType, bytes, spoiler = item.spoiler)
                                 }
                                 api.createPost(
                                     content = text,
@@ -1818,8 +1955,11 @@ private fun MainShell(
                     notification = notification,
                     onClick = {
                         notificationToastVisible = false
-                        notification.post?.let { pushOverlay(Overlay.PostDetail(it.toUiPost())) }
-                            ?: pushOverlay(Overlay.Notifications())
+                        when {
+                            notification.type.equals("DM", ignoreCase = true) -> selectSection(Section.DM)
+                            notification.post != null -> pushOverlay(Overlay.PostDetail(notification.post.toUiPost()))
+                            else -> pushOverlay(Overlay.Notifications())
+                        }
                     },
                     onDismiss = { notificationToastVisible = false }
                 )
@@ -3183,7 +3323,13 @@ private fun NotificationToastCard(notification: ApiNotification, onClick: () -> 
         Spacer(Modifier.width(11.dp))
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                KText("新しい通知", 9, Carrot, FontWeight.Black, letterSpacing = .5f)
+                KText(
+                    if (notification.type.equals("DM", ignoreCase = true)) "新しいメッセージ" else "新しい通知",
+                    9,
+                    Carrot,
+                    FontWeight.Black,
+                    letterSpacing = .5f
+                )
                 Spacer(Modifier.weight(1f))
                 KText(relativeTime(notification.createdAt), 9, Muted, FontWeight.Medium)
             }
@@ -3302,8 +3448,17 @@ private fun FilterStrip(
             items(options, key = { it.second }) { option ->
                 val (label, mode) = option
                 val selected = selectedMode == mode
+                val modeIcon = when (mode) {
+                    "latest" -> IconType.HOME
+                    "following" -> IconType.PERSON
+                    "trending" -> IconType.TROPHY
+                    else -> IconType.COMMUNITY
+                }
+                val baseWidth = (label.length * 13 + 40).dp
+                    .coerceAtLeast(78.dp)
+                    .coerceAtMost(154.dp)
                 val optionWidth by animateDpAsState(
-                    if (selected) 100.dp else 96.dp,
+                    if (selected) baseWidth + 3.dp else baseWidth,
                     tween(260, easing = FastOutSlowInEasing),
                     label = "homeModeWidth"
                 )
@@ -3325,7 +3480,7 @@ private fun FilterStrip(
                 val community = mode.takeIf { it.startsWith("community:") }?.substringAfter(':')?.toLongOrNull()
                     ?.let { id -> homeCommunities.firstOrNull { it.id == id } }
                 Box(
-                    Modifier.width(optionWidth).widthIn(max = 150.dp)
+                    Modifier.width(optionWidth)
                         .height(34.dp).clip(RoundedCornerShape(18.dp))
                         .background(optionBackground)
                         .border(1.dp, optionBorder, RoundedCornerShape(18.dp))
@@ -3333,9 +3488,14 @@ private fun FilterStrip(
                             onClick = { onModeChange(mode) },
                             onLongClick = { community?.let(onRemoveCommunity) }
                         )
-                        .padding(horizontal = 14.dp),
+                        .padding(horizontal = 10.dp),
                     contentAlignment = Alignment.Center
-                ) { KText(label, 12, optionText, FontWeight.Bold, maxLines = 1) }
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        CustomIcon(modeIcon, optionText, 14.dp, selected)
+                        KText(label, 12, optionText, FontWeight.Bold, maxLines = 1)
+                    }
+                }
             }
         }
         if (selectedMode != "trending" && !selectedMode.startsWith("community:")) {
@@ -3346,7 +3506,10 @@ private fun FilterStrip(
                         .border(1.dp, Hairline, RoundedCornerShape(14.dp)).padding(4.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    listOf("最新" to "latest", "おすすめ" to "recommended").forEach { (label, value) ->
+                    listOf(
+                        Triple("最新", "latest", IconType.REFRESH),
+                        Triple("おすすめ", "recommended", IconType.HEART)
+                    ).forEach { (label, value, icon) ->
                         val selected = selectedRanking == value
                         val rankingBackground by animateColorAsState(
                             if (selected) Strong else Color.Transparent,
@@ -3365,7 +3528,10 @@ private fun FilterStrip(
                                 .padding(horizontal = 18.dp, vertical = 8.dp),
                             contentAlignment = Alignment.Center
                         ) {
-                            KText(label, 10, rankingText, FontWeight.Bold)
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                CustomIcon(icon, rankingText, 13.dp, selected)
+                                KText(label, 10, rankingText, FontWeight.Bold, maxLines = 1)
+                            }
                         }
                     }
                 }
@@ -3479,10 +3645,13 @@ private fun PostCard(
     showAbsoluteTime: Boolean = false,
     onQuotedOpen: ((Post) -> Unit)? = null
 ) {
-    var localLiked by remember(post.id) { mutableStateOf(post.initiallyLiked) }
+    var localLiked by remember(post.id, post.initiallyLiked) { mutableStateOf(post.initiallyLiked) }
     var localRekaroted by remember(post.id, post.initiallyRekaroted) { mutableStateOf(post.initiallyRekaroted) }
-    var localBookmarked by remember(post.id) { mutableStateOf(post.initiallyBookmarked) }
+    var localBookmarked by remember(post.id, post.initiallyBookmarked) { mutableStateOf(post.initiallyBookmarked) }
     var reactions by remember(post.id) { mutableStateOf(post.reactions) }
+    var pendingReactionChanges by remember(post.id) {
+        mutableStateOf<Map<String, Boolean>>(emptyMap())
+    }
     var poll by remember(post.id) { mutableStateOf(post.poll) }
     var reactionPickerOpen by remember(post.id) { mutableStateOf(false) }
     var textExpanded by remember(post.id, post.text) { mutableStateOf(false) }
@@ -3492,6 +3661,7 @@ private fun PostCard(
     var menuActionBusy by remember(post.id) { mutableStateOf(false) }
     var hiddenByMenuAction by remember(post.id) { mutableStateOf(false) }
     val isLongPost = post.text.length > 240 || post.text.count { it == '\n' } >= 5
+    val context = LocalContext.current
     val reactionHandler = LocalReactionHandler.current
     val pollVoteHandler = LocalPollVoteHandler.current
     val postMenuEnvironment = LocalPostMenuEnvironment.current
@@ -3512,6 +3682,14 @@ private fun PostCard(
     val likeScale by animateFloatAsState(if (liked) 1.18f else 1f, spring(dampingRatio = .38f), label = "like")
     val cardAccent = post.cardAccentColor.toAppColor()?.takeIf {
         post.showCardDecoration && post.subscriptionStatus.equals("ACTIVE", true)
+    }
+    LaunchedEffect(post.id, post.reactions) {
+        val unreconciled = pendingReactionChanges.filter { (emoji, desired) ->
+            val serverReacted = post.reactions.firstOrNull { it.emoji == emoji }?.reacted == true
+            serverReacted != desired
+        }
+        pendingReactionChanges = unreconciled
+        reactions = mergePendingReactions(post.reactions, unreconciled)
     }
     if (hiddenByMenuAction) return
     if (postMenuOpen) {
@@ -3814,6 +3992,7 @@ private fun PostCard(
                         onReact = { emoji ->
                             val current = reactions.firstOrNull { it.emoji == emoji }
                             val desired = current?.reacted != true
+                            pendingReactionChanges = pendingReactionChanges + (emoji to desired)
                             reactions = if (current == null) {
                                 reactions + ApiReaction(emoji, 1, true)
                             } else {
@@ -3848,12 +4027,16 @@ private fun PostCard(
                     }
                     Spacer(Modifier.width(9.dp))
                     val quoteAllowed = onQuote != null && post.canQuote && !post.isPrivateAccount
-                    Box(
+                    val quoteColor = if (quoteAllowed) Muted else Hairline
+                    Row(
                         Modifier.clip(RoundedCornerShape(10.dp))
                             .clickable(enabled = quoteAllowed) { onQuote?.invoke(post) }
-                            .padding(4.dp)
+                            .padding(4.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        KText("❝", 17, if (quoteAllowed) Muted else Hairline, FontWeight.Bold)
+                        KText("❝", 17, quoteColor, FontWeight.Bold)
+                        Spacer(Modifier.width(5.dp))
+                        KText(post.quoteUsersCount.coerceAtLeast(0).toString(), 11, quoteColor, FontWeight.Medium)
                     }
                     Spacer(Modifier.width(9.dp))
                     Row(
@@ -3889,6 +4072,22 @@ private fun PostCard(
                         onBookmark?.invoke(!bookmarked)
                     }.padding(4.dp)) {
                         CustomIcon(IconType.BOOKMARK, if (bookmarked) Carrot else Muted, 17.dp, filled = bookmarked)
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Box(
+                        Modifier.clip(RoundedCornerShape(10.dp))
+                            .clickable(enabled = post.id != null && post.authorId > 0L) {
+                                post.id?.let { postId ->
+                                    openShareMenu(context, "投稿を共有", postWebUrl(post.authorId, postId))
+                                }
+                            }
+                            .padding(4.dp)
+                    ) {
+                        CustomIcon(
+                            IconType.SHARE,
+                            if (post.id != null && post.authorId > 0L) Muted else Hairline,
+                            17.dp
+                        )
                     }
                 }
             }
@@ -4067,6 +4266,8 @@ private fun SubscriptionBadge(plan: String, status: String, visible: Boolean, co
 
 private val FrequentReactionEmojis = listOf("👈", "👍", "❤️", "😂", "😮", "😢", "🔥")
 
+private fun normalizedReactionEmoji(value: String): String = value.replace("\uFE0F", "")
+
 private val BmpReactionEmojis = listOf(
     "☀️", "☁️", "☂️", "☃️", "☄️", "☎️", "☑️", "☔", "☕", "☘️", "☝️", "☠️",
     "☢️", "☣️", "☦️", "☪️", "☮️", "☯️", "☸️", "☹️", "☺️", "♀️", "♂️", "♟️",
@@ -4076,6 +4277,15 @@ private val BmpReactionEmojis = listOf(
     "⛽", "✂️", "✅", "✈️", "✉️", "✊", "✋", "✌️", "✍️", "✏️", "✒️", "✔️",
     "✖️", "✝️", "✡️", "✨", "✳️", "✴️", "❄️", "❇️", "❌", "❎", "❓", "❔",
     "❕", "❗", "❣️", "❤️", "⭐", "⭕", "➕", "➖", "➗", "➡️", "➰", "➿"
+)
+
+private val OfficialStandardReactionEmojis = listOf(
+    "🧢", "🪖", "⛑️", "📿", "💄", "💍", "💎", "🔇", "🔈", "🔉", "🔊", "📢", "📣", "📯", "🔔", "🔕",
+    "🎼", "🎵", "🎶", "🎙️", "🎚️", "🎛️", "🎤", "🎧", "📻", "🎷", "🪗", "🎸", "🎹", "🎺", "🎻", "🪕",
+    "🥁", "🪘", "🪇", "🪈", "📱", "📲", "☎️", "📞", "📟", "📠", "🔋", "🪫", "🔌", "💻", "🖥️", "🖨️",
+    "⌨️", "🖱️", "🖲️", "💽", "💾", "💿", "📀", "🧮", "🎥", "🎞️", "📽️", "🎬", "📺", "📷", "📸", "📹",
+    "📼", "🔍", "🔎", "🕯️", "💡", "🔦", "🏮", "🪔", "📔", "📕", "📖", "📗", "📘", "📙", "📚", "📓",
+    "📒", "📃", "📜", "📄", "📰", "🗞️", "📑", "🔖"
 )
 
 private val AllReactionEmojis: List<String> by lazy {
@@ -4089,24 +4299,27 @@ private val AllReactionEmojis: List<String> by lazy {
         "👨‍👩‍👧", "👨‍👩‍👦", "👩‍👩‍👧", "👨‍👨‍👦", "👩‍❤️‍👩", "👨‍❤️‍👨",
         "👩‍❤️‍💋‍👩", "👨‍❤️‍💋‍👨"
     )
-    val ranges = listOf(
-        0x1F300..0x1F5FF,
-        0x1F600..0x1F64F,
-        0x1F680..0x1F6FF,
-        0x1F900..0x1F9FF,
-        0x1FA70..0x1FAFF
-    )
     buildList {
         addAll(FrequentReactionEmojis)
         addAll(BmpReactionEmojis)
         addAll(joinedEmoji)
-        ranges.forEach { range ->
+        addAll(OfficialStandardReactionEmojis)
+        val emojiRanges = listOf(0x00A9..0x3299, 0x1F000..0x1FAFF)
+        emojiRanges.forEach { range ->
             range.forEach { codePoint ->
-                if (Character.isDefined(codePoint) && codePoint !in 0x1F3FB..0x1F3FF) {
+                val isEmoji = UCharacter.hasBinaryProperty(codePoint, UProperty.EMOJI)
+                val isModifier = UCharacter.hasBinaryProperty(codePoint, UProperty.EMOJI_MODIFIER)
+                val isRegionalIndicator = codePoint in 0x1F1E6..0x1F1FF
+                val isKeycapBase = codePoint == '#'.code || codePoint == '*'.code || codePoint in '0'.code..'9'.code
+                if (isEmoji && !isModifier && !isRegionalIndicator && !isKeycapBase) {
                     val value = String(Character.toChars(codePoint))
-                    add(value)
+                    val emojiPresentation = UCharacter.hasBinaryProperty(codePoint, UProperty.EMOJI_PRESENTATION)
+                    add(if (emojiPresentation || value.endsWith("️")) value else "$value️")
                 }
             }
+        }
+        listOf("#", "*", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9").forEach { base ->
+            add("$base\uFE0F\u20E3")
         }
         java.util.Locale.getISOCountries().forEach { country ->
             val first = Character.toChars(0x1F1E6 + (country[0] - 'A'))
@@ -4123,6 +4336,175 @@ private data class ReactionOption(
     val isPro: Boolean = false,
     val searchKeywords: String = label
 )
+
+private const val OfficialEmojiCatalogUrl = "https://karotter.com/assets/compact-CGlrqpBR.json"
+private const val OfficialEmojiCachePreferences = "official_emoji_catalog"
+private const val OfficialEmojiCacheJson = "catalog_json"
+private const val OfficialEmojiCacheUpdatedAt = "catalog_updated_at"
+private const val OfficialEmojiCacheLifetimeMillis = 24L * 60L * 60L * 1000L
+private const val ReactionUsagePreferences = "reaction_usage_history"
+private const val ReactionUsageJson = "usage_json"
+private const val MaximumFrequentReactions = 16
+private val reactionUsageLock = Any()
+
+@Volatile
+private var processOfficialReactionOptions: List<ReactionOption>? = null
+
+@Volatile
+private var processOfficialReactionValues: Set<String> = emptySet()
+
+private data class ReactionUsage(val value: String, val count: Int, val lastUsedAt: Long)
+
+private fun readReactionUsage(context: Context): List<ReactionUsage> = synchronized(reactionUsageLock) {
+    val rawJson = context.getSharedPreferences(ReactionUsagePreferences, Context.MODE_PRIVATE)
+        .getString(ReactionUsageJson, null)
+        ?: return@synchronized emptyList()
+    runCatching {
+        val entries = JSONArray(rawJson)
+        buildList {
+            for (index in 0 until entries.length()) {
+                val entry = entries.optJSONObject(index) ?: continue
+                val value = entry.optString("value").trim()
+                if (value.isNotEmpty()) {
+                    add(
+                        ReactionUsage(
+                            value = value,
+                            count = entry.optInt("count", 1).coerceAtLeast(1),
+                            lastUsedAt = entry.optLong("lastUsedAt", 0L)
+                        )
+                    )
+                }
+            }
+        }
+    }.getOrDefault(emptyList())
+}
+
+private fun recordReactionUsage(context: Context, value: String) = synchronized(reactionUsageLock) {
+    val preferences = context.getSharedPreferences(ReactionUsagePreferences, Context.MODE_PRIVATE)
+    val current = runCatching {
+        val entries = JSONArray(preferences.getString(ReactionUsageJson, "[]"))
+        buildList {
+            for (index in 0 until entries.length()) {
+                val entry = entries.optJSONObject(index) ?: continue
+                val storedValue = entry.optString("value").trim()
+                if (storedValue.isNotEmpty()) {
+                    add(ReactionUsage(storedValue, entry.optInt("count", 1).coerceAtLeast(1), entry.optLong("lastUsedAt", 0L)))
+                }
+            }
+        }
+    }.getOrDefault(emptyList())
+    val previous = current.firstOrNull { it.value == value }
+    val updated = (current.filterNot { it.value == value } + ReactionUsage(
+        value = value,
+        count = (previous?.count ?: 0) + 1,
+        lastUsedAt = System.currentTimeMillis()
+    )).sortedWith(compareByDescending<ReactionUsage> { it.count }.thenByDescending { it.lastUsedAt })
+        .take(128)
+    val json = JSONArray().apply {
+        updated.forEach { usage ->
+            put(JSONObject().apply {
+                put("value", usage.value)
+                put("count", usage.count)
+                put("lastUsedAt", usage.lastUsedAt)
+            })
+        }
+    }
+    preferences.edit().putString(ReactionUsageJson, json.toString()).apply()
+}
+
+private fun officialEmojiCategory(group: Int): String = when (group) {
+    0 -> "表情"
+    1 -> "人・ジェスチャー"
+    3 -> "動物・自然"
+    4 -> "食べ物"
+    5 -> "旅行・場所"
+    6 -> "アクティビティ"
+    7 -> "モノ"
+    8 -> "記号・その他"
+    9 -> "旗"
+    else -> "記号・その他"
+}
+
+private fun parseOfficialReactionOptions(rawJson: String): List<ReactionOption> {
+    val entries = JSONArray(rawJson)
+    return buildList {
+        for (index in 0 until entries.length()) {
+            val entry = entries.optJSONObject(index) ?: continue
+            val unicode = entry.optString("unicode").trim()
+            val group = if (entry.has("group") && !entry.isNull("group")) entry.optInt("group", -1) else -1
+            // group 2 contains skin/hair modifiers rather than standalone reactions.
+            if (unicode.isEmpty() || group !in 0..9 || group == 2) continue
+            val label = entry.optString("label", unicode).ifBlank { unicode }
+            val tagsJson = entry.optJSONArray("tags")
+            val tags = buildList {
+                if (tagsJson != null) for (tagIndex in 0 until tagsJson.length()) {
+                    tagsJson.optString(tagIndex).takeIf(String::isNotBlank)?.let(::add)
+                }
+            }
+            add(
+                Triple(
+                    entry.optInt("order", Int.MAX_VALUE),
+                    unicode,
+                    ReactionOption(
+                        value = unicode,
+                        label = label,
+                        category = if (unicode in FrequentReactionEmojis) "よく使う" else officialEmojiCategory(group),
+                        searchKeywords = buildString {
+                            append(unicode)
+                            append(' ')
+                            append(label)
+                            if (tags.isNotEmpty()) {
+                                append(' ')
+                                append(tags.joinToString(" "))
+                            }
+                        }
+                    )
+                )
+            )
+        }
+    }.sortedBy { it.first }
+        .distinctBy { it.second }
+        .map { it.third }
+}
+
+private suspend fun loadOfficialReactionOptions(context: Context): List<ReactionOption> = withContext(Dispatchers.IO) {
+    processOfficialReactionOptions?.let { return@withContext it }
+    val preferences = context.getSharedPreferences(OfficialEmojiCachePreferences, Context.MODE_PRIVATE)
+    val cachedJson = preferences.getString(OfficialEmojiCacheJson, null)
+    val cacheAge = System.currentTimeMillis() - preferences.getLong(OfficialEmojiCacheUpdatedAt, 0L)
+    val rawJson = if (!cachedJson.isNullOrBlank() && cacheAge in 0 until OfficialEmojiCacheLifetimeMillis) {
+        cachedJson
+    } else {
+        runCatching {
+            val connection = (URL(OfficialEmojiCatalogUrl).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 10_000
+                readTimeout = 15_000
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("User-Agent", "Karoha/Android")
+            }
+            try {
+                check(connection.responseCode in 200..299) { "Emoji catalog HTTP ${connection.responseCode}" }
+                connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            } finally {
+                connection.disconnect()
+            }
+        }.getOrNull()?.also { downloaded ->
+            preferences.edit()
+                .putString(OfficialEmojiCacheJson, downloaded)
+                .putLong(OfficialEmojiCacheUpdatedAt, System.currentTimeMillis())
+                .apply()
+        } ?: cachedJson
+    }
+    val parsed = rawJson?.let { runCatching { parseOfficialReactionOptions(it) }.getOrNull() }.orEmpty()
+    if (parsed.isNotEmpty()) {
+        processOfficialReactionOptions = parsed
+        processOfficialReactionValues = parsed.mapTo(mutableSetOf(), ReactionOption::value)
+        parsed
+    } else {
+        StandardReactionOptions
+    }
+}
 
 private val ProReactionOptions = listOf(
     "pro:ai" to "愛", "pro:arara" to "あらら", "pro:arigato" to "ありがとう",
@@ -4219,11 +4601,7 @@ private fun emojiJapaneseKeywords(value: String): String {
 
 private fun isEmojiReaction(value: String): Boolean {
     if (value.startsWith("pro:", ignoreCase = true)) return true
-    if (value in FrequentReactionEmojis) return true
-    val firstCodePoint = value.codePointAtOrNull(0) ?: return false
-    return firstCodePoint in 0x1F300..0x1FAFF ||
-        firstCodePoint in 0x1F1E6..0x1F1FF ||
-        value in BmpReactionEmojis
+    return value in processOfficialReactionValues || value in AllReactionEmojis
 }
 
 private fun String.codePointAtOrNull(index: Int): Int? =
@@ -4306,6 +4684,27 @@ private fun ReactionVisual(value: String, imageSize: Dp, emojiSize: Int) {
 @Composable
 private fun ReactionStrip(reactions: List<ApiReaction>, pickerOpen: Boolean, onTogglePicker: () -> Unit, onReact: (String) -> Unit) {
     val viewerIsPro = LocalViewerIsPro.current
+    val context = LocalContext.current
+    var officialOptions by remember { mutableStateOf<List<ReactionOption>>(emptyList()) }
+    var catalogLoaded by remember { mutableStateOf(false) }
+    var usageHistory by remember { mutableStateOf<List<ReactionUsage>>(emptyList()) }
+    val reactAndTrack: (String) -> Unit = { value ->
+        val isAddingReaction = reactions.firstOrNull { it.emoji == value }?.reacted != true
+        if (isAddingReaction) {
+            recordReactionUsage(context.applicationContext, value)
+            usageHistory = readReactionUsage(context.applicationContext)
+        }
+        onReact(value)
+    }
+    LaunchedEffect(pickerOpen) {
+        if (pickerOpen) {
+            if (!catalogLoaded) {
+                officialOptions = loadOfficialReactionOptions(context.applicationContext)
+                catalogLoaded = true
+            }
+            usageHistory = readReactionUsage(context.applicationContext)
+        }
+    }
     Column {
         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             item {
@@ -4320,7 +4719,7 @@ private fun ReactionStrip(reactions: List<ApiReaction>, pickerOpen: Boolean, onT
                     Modifier.clip(RoundedCornerShape(12.dp))
                         .background(if (reaction.reacted) PaleCarrot else Surface)
                         .border(1.dp, if (reaction.reacted) Carrot else Hairline, RoundedCornerShape(12.dp))
-                        .clickable(enabled = selectable) { onReact(reaction.emoji) }
+                        .clickable(enabled = selectable) { reactAndTrack(reaction.emoji) }
                         .alpha(if (selectable) 1f else .52f)
                         .padding(horizontal = 9.dp, vertical = 5.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -4350,23 +4749,51 @@ private fun ReactionStrip(reactions: List<ApiReaction>, pickerOpen: Boolean, onT
             )
             val categories = remember(viewerIsPro) {
                 buildList {
-                    addAll(listOf("すべて", "よく使う", "表情", "人・ジェスチャー", "動物・自然", "食べ物", "記号・その他", "旗"))
+                    addAll(listOf("すべて", "よく使う", "表情", "人・ジェスチャー", "動物・自然", "食べ物", "旅行・場所", "アクティビティ", "モノ", "記号・その他", "旗"))
                     if (viewerIsPro) add("Pro")
                 }
             }
-            val availableOptions = remember(viewerIsPro) {
-                if (viewerIsPro) StandardReactionOptions + ProReactionOptions else StandardReactionOptions
+            val availableOptions = remember(viewerIsPro, officialOptions) {
+                val standard = officialOptions.ifEmpty { StandardReactionOptions }
+                if (viewerIsPro) standard + ProReactionOptions else standard
             }
-            val visibleOptions = remember(availableOptions, searchQuery, selectedCategory) {
+            val frequentOptions = remember(availableOptions, usageHistory) {
+                val optionsByValue = availableOptions.associateBy(ReactionOption::value)
+                // The official catalog adds U+FE0F to some entries (for example 👈️ and 👍️),
+                // while the original defaults intentionally use 👈 and 👍. Build the fixed
+                // entries independently so all seven are always present and keep their old values.
+                val fixed = FrequentReactionEmojis.map { value ->
+                    val catalogOption = availableOptions.firstOrNull {
+                        normalizedReactionEmoji(it.value) == normalizedReactionEmoji(value)
+                    }
+                    ReactionOption(
+                        value = value,
+                        label = catalogOption?.label ?: value,
+                        category = "よく使う",
+                        searchKeywords = catalogOption?.searchKeywords ?: emojiJapaneseKeywords(value)
+                    )
+                }
+                val fixedNormalizedValues = FrequentReactionEmojis.mapTo(mutableSetOf(), ::normalizedReactionEmoji)
+                val automatic = usageHistory.asSequence()
+                    .map(ReactionUsage::value)
+                    .filterNot { normalizedReactionEmoji(it) in fixedNormalizedValues }
+                    .distinct()
+                    .mapNotNull(optionsByValue::get)
+                    .take((MaximumFrequentReactions - fixed.size).coerceAtLeast(0))
+                    .toList()
+                fixed + automatic
+            }
+            val visibleOptions = remember(availableOptions, frequentOptions, searchQuery, selectedCategory) {
                 val normalizedQuery = searchQuery.trim().lowercase()
-                availableOptions.filter { option ->
-                    if (normalizedQuery.isNotEmpty()) {
+                when {
+                    normalizedQuery.isNotEmpty() -> availableOptions.filter { option ->
                         option.label.lowercase().contains(normalizedQuery) ||
                             option.value.lowercase().contains(normalizedQuery) ||
                             option.searchKeywords.lowercase().contains(normalizedQuery)
-                    } else {
-                        selectedCategory == "すべて" || option.category == selectedCategory
                     }
+                    selectedCategory == "すべて" -> availableOptions
+                    selectedCategory == "よく使う" -> frequentOptions
+                    else -> availableOptions.filter { it.category == selectedCategory }
                 }
             }
             Dialog(onDismissRequest = onTogglePicker) {
@@ -4474,7 +4901,7 @@ private fun ReactionStrip(reactions: List<ApiReaction>, pickerOpen: Boolean, onT
                             Column(
                                 Modifier.height(62.dp).clip(RoundedCornerShape(12.dp))
                                     .background(Surface)
-                                    .clickable { onReact(option.value) }
+                                    .clickable { reactAndTrack(option.value) }
                                     .padding(horizontal = 4.dp, vertical = 5.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally,
                                 verticalArrangement = Arrangement.Center
@@ -6858,7 +7285,11 @@ private fun SearchResultsScreen(
                     Modifier.weight(1f).clickable(enabled = enabled) { selectedTab = index }.padding(top = 13.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    KText(label, 12, if (selectedTab == index) Ink else if (enabled) Muted else Muted.copy(.45f), FontWeight.Bold, maxLines = 1)
+                    val contentColor = if (selectedTab == index) Ink else if (enabled) Muted else Muted.copy(.45f)
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                        CustomIcon(if (index == 0) IconType.BOARD else IconType.PERSON, contentColor, 15.dp, selectedTab == index)
+                        KText(label, 12, contentColor, FontWeight.Bold, maxLines = 1)
+                    }
                     Spacer(Modifier.height(11.dp))
                     Box(Modifier.width(indicatorWidth).height(3.dp).background(if (selectedTab == index) Carrot else Color.Transparent, RoundedCornerShape(2.dp)))
                 }
@@ -6867,9 +7298,25 @@ private fun SearchResultsScreen(
         Box(Modifier.fillMaxWidth().height(1.dp).background(Hairline))
         if (selectedTab == 0) {
             Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("人気" to "popular", "最新" to "latest", "古い" to "oldest", "メディア" to "media").forEach { (label, value) ->
-                    Box(Modifier.clip(RoundedCornerShape(13.dp)).background(if (postSort == value) Strong else Surface).border(1.dp, if (postSort == value) Strong else Hairline, RoundedCornerShape(13.dp)).clickable { onPostSortChange(value) }.padding(horizontal = 18.dp, vertical = 8.dp)) {
-                        KText(label, 11, if (postSort == value) OnStrong else Muted, FontWeight.Bold)
+                listOf(
+                    Triple("人気", "popular", IconType.TROPHY),
+                    Triple("最新", "latest", IconType.REFRESH),
+                    Triple("古い", "oldest", IconType.CALENDAR),
+                    Triple("メディア", "media", IconType.IMAGE)
+                ).forEach { (label, value, icon) ->
+                    val selected = postSort == value
+                    Row(
+                        Modifier.weight(1f).clip(RoundedCornerShape(13.dp))
+                            .background(if (selected) Strong else Surface)
+                            .border(1.dp, if (selected) Strong else Hairline, RoundedCornerShape(13.dp))
+                            .clickable { onPostSortChange(value) }
+                            .padding(horizontal = 7.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        CustomIcon(icon, if (selected) OnStrong else Muted, 13.dp, selected)
+                        Spacer(Modifier.width(5.dp))
+                        KText(label, 10, if (selected) OnStrong else Muted, FontWeight.Bold, maxLines = 1)
                     }
                 }
             }
@@ -7143,7 +7590,10 @@ private fun PostDetailScreen(
             is ApiResult.Success -> replies = result.value.map(ApiPost::toUiPost).distinctBy(::postStableKey)
             is ApiResult.Failure -> error = result.message
         }
-        when (val result = results.third) { is ApiResult.Success -> if (result.value.isNotEmpty()) post = post.copy(reactions = result.value); is ApiResult.Failure -> Unit }
+        when (val result = results.third) {
+            is ApiResult.Success -> post = post.copy(reactions = result.value)
+            is ApiResult.Failure -> Unit
+        }
         loading = false
     }
     if (showEngagementDetails) {
@@ -8562,7 +9012,6 @@ private fun NotificationsScreen(api: KarotterApi, retainedState: NotificationsRe
             "FOLLOWED_POST" to "投稿通知",
             "FOLLOW_REQUEST" to "フォロー申請",
             "REACTION" to "リアクション",
-            "DM" to "DM",
             "QUOTE" to "引用",
             "BOARD_NEW_THREAD,BOARD_THREAD_REPLY" to "掲示板",
             "COMMUNITY_INVITE,COMMUNITY_JOIN,COMMUNITY_REMOVAL" to "コミュニティ",
@@ -8572,6 +9021,9 @@ private fun NotificationsScreen(api: KarotterApi, retainedState: NotificationsRe
     }
     val listState = retainedState.listState
     val scope = rememberCoroutineScope()
+    LaunchedEffect(Unit) {
+        if (selectedType.equals("DM", ignoreCase = true)) selectedType = null
+    }
     fun notificationKey(item: ApiNotification) = "${item.id}:${item.type}:${item.actorName}:${item.createdAt}"
     suspend fun loadNextPage() {
         if (loading || !hasMore) return
@@ -8585,7 +9037,9 @@ private fun NotificationsScreen(api: KarotterApi, retainedState: NotificationsRe
             is ApiResult.Success -> {
                 if (revision != requestRevision || requestedType != selectedType) return
                 val rawPageItems = result.value.distinctBy(::notificationKey)
-                val pageItems = rawPageItems.filterNot(ApiNotification::suppressed)
+                val pageItems = rawPageItems.filter {
+                    !it.suppressed && !it.type.equals("DM", ignoreCase = true)
+                }
                 val existing = notifications.mapTo(hashSetOf(), ::notificationKey)
                 val additions = pageItems.filter { notificationKey(it) !in existing }
                 notifications = (notifications + additions).distinctBy(::notificationKey)
@@ -8763,7 +9217,12 @@ private fun notificationLabel(type: String) = when (type.uppercase()) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun DmScreen(api: KarotterApi, currentUser: ApiUser?, onConversationState: (Boolean) -> Unit) {
+private fun DmScreen(
+    api: KarotterApi,
+    currentUser: ApiUser?,
+    onConversationState: (Boolean) -> Unit,
+    onUnreadCountChanged: (Int) -> Unit
+) {
     val context = LocalContext.current
     val groupNamePrefs = remember { context.getSharedPreferences("karotter_dm_group_names_v1", android.content.Context.MODE_PRIVATE) }
     var groups by remember { mutableStateOf<List<ApiDmGroup>>(emptyList()) }
@@ -8778,6 +9237,15 @@ private fun DmScreen(api: KarotterApi, currentUser: ApiUser?, onConversationStat
         if (group.name.isNotBlank()) group
         else group.copy(name = groupNamePrefs.getString("group_${group.id}", "").orEmpty())
     }
+    fun unreadTotal(value: List<ApiDmGroup>): Int =
+        value.sumOf { it.unreadCount } + value.count { it.isRequest && it.unreadCount == 0 }
+    fun updateGroups(value: List<ApiDmGroup>) {
+        groups = namesApplied(value)
+        onUnreadCountChanged(unreadTotal(groups))
+    }
+    fun markGroupLocallyRead(groupId: Long) {
+        updateGroups(groups.map { if (it.id == groupId) it.copy(unreadCount = 0) else it })
+    }
     BackHandler(enabled = (selected != null || creating) && LocalNavigationActive.current) {
         if (creating) creating = false else selected = null
     }
@@ -8786,7 +9254,7 @@ private fun DmScreen(api: KarotterApi, currentUser: ApiUser?, onConversationStat
     LaunchedEffect(reloadKey) {
         loading = true
         when (val result = withContext(Dispatchers.IO) { api.dmGroups() }) {
-            is ApiResult.Success -> groups = namesApplied(result.value)
+            is ApiResult.Success -> updateGroups(result.value)
             is ApiResult.Failure -> error = result.message
         }
         loading = false
@@ -8796,7 +9264,7 @@ private fun DmScreen(api: KarotterApi, currentUser: ApiUser?, onConversationStat
             delay(5_000)
             when (val result = withContext(Dispatchers.IO) { api.dmGroups() }) {
                 is ApiResult.Success -> {
-                    groups = namesApplied(result.value)
+                    updateGroups(result.value)
                     error = null
                 }
                 is ApiResult.Failure -> if (groups.isEmpty()) error = result.message
@@ -8833,9 +9301,11 @@ private fun DmScreen(api: KarotterApi, currentUser: ApiUser?, onConversationStat
             },
             onLeft = {
                 groups = groups.filterNot { it.id == group.id }
+                onUnreadCountChanged(unreadTotal(groups))
                 selected = null
                 reloadKey += 1
-            }
+            },
+            onRead = { markGroupLocallyRead(group.id) }
         )
         return
     }
@@ -8854,6 +9324,7 @@ private fun DmScreen(api: KarotterApi, currentUser: ApiUser?, onConversationStat
             },
             onLeft = {
                 groups = groups.filterNot { it.id == target.id }
+                onUnreadCountChanged(unreadTotal(groups))
                 managementGroup = null
                 reloadKey += 1
             }
@@ -8899,6 +9370,9 @@ private fun DmScreen(api: KarotterApi, currentUser: ApiUser?, onConversationStat
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
+                        val contentColor = if (selectedTab == index) Ink else Muted
+                        CustomIcon(if (index == 0) IconType.DM else IconType.BELL, contentColor, 14.dp, selectedTab == index)
+                        Spacer(Modifier.width(6.dp))
                         KText(label, 12, if (selectedTab == index) Ink else Muted, FontWeight.Bold)
                         if (index == 1) {
                             val count = groups.count { it.isRequest }
@@ -8940,7 +9414,10 @@ private fun DmScreen(api: KarotterApi, currentUser: ApiUser?, onConversationStat
                     Row(
                         Modifier.fillMaxWidth()
                             .combinedClickable(
-                                onClick = { selected = group },
+                                onClick = {
+                                    markGroupLocallyRead(group.id)
+                                    selected = group.copy(unreadCount = 0)
+                                },
                                 onLongClick = { managementGroup = group }
                             )
                             .padding(horizontal = 22.dp, vertical = 15.dp),
@@ -9198,7 +9675,8 @@ private fun DmConversationScreen(
     onAccepted: (ApiDmGroup) -> Unit = {},
     onRejected: () -> Unit = {},
     onCleared: () -> Unit = {},
-    onLeft: () -> Unit = {}
+    onLeft: () -> Unit = {},
+    onRead: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var messages by remember(group.id) { mutableStateOf<List<ApiDmMessage>>(emptyList()) }
@@ -9256,7 +9734,12 @@ private fun DmConversationScreen(
                         if (firstLoad) listState.scrollToItem(updated.lastIndex)
                         else listState.animateScrollToItem(updated.lastIndex)
                     }
-                    if (firstLoad || hasNewMessage) withContext(Dispatchers.IO) { api.markDmRead(group.id) }
+                    if (firstLoad || hasNewMessage) {
+                        when (withContext(Dispatchers.IO) { api.markDmRead(group.id) }) {
+                            is ApiResult.Success -> onRead()
+                            is ApiResult.Failure -> Unit
+                        }
+                    }
                 }
                 is ApiResult.Failure -> if (messages.isEmpty()) error = result.message
             }
@@ -9758,10 +10241,20 @@ private fun MyPageScreen(user: ApiUser?, api: KarotterApi, themeKey: String, fol
     val darkMode = themeKey.endsWith("-dark")
     val themeFamily = themeKey.removeSuffix("-dark")
     LaunchedEffect(page, user.id, user.username, profileReloadKey) {
-        if (page != "profile" && page != "profileEdit") return@LaunchedEffect
-        when (val result = withContext(Dispatchers.IO) { api.user(user.username) }) {
-            is ApiResult.Success -> detailedProfileUser = result.value
-            is ApiResult.Failure -> Unit
+        if (page != "root" && page != "profile" && page != "profileEdit") return@LaunchedEffect
+        suspend fun refreshProfileCard() {
+            when (val result = withContext(Dispatchers.IO) { api.user(user.username) }) {
+                is ApiResult.Success -> detailedProfileUser = result.value
+                is ApiResult.Failure -> Unit
+            }
+        }
+        if (page == "root") {
+            while (true) {
+                refreshProfileCard()
+                delay(15_000L)
+            }
+        } else {
+            refreshProfileCard()
         }
     }
     BackHandler(enabled = page != "root" && LocalNavigationActive.current) { page = "root" }
@@ -10255,6 +10748,7 @@ private fun MyPageScreen(user: ApiUser?, api: KarotterApi, themeKey: String, fol
             return
         }
     }
+    val rootUser = detailedProfileUser
     MyPageTransition("root", false) {
     LazyColumn(Modifier.fillMaxSize().background(Paper), contentPadding = PaddingValues(bottom = 126.dp)) {
         item {
@@ -10268,7 +10762,7 @@ private fun MyPageScreen(user: ApiUser?, api: KarotterApi, themeKey: String, fol
                     KText("マイページ", 29, Ink, FontWeight.Black)
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                    if (user.isPrivate) {
+                    if (rootUser.isPrivate) {
                         Box(
                             Modifier.size(42.dp).background(Surface, RoundedCornerShape(14.dp))
                                 .border(1.dp, Hairline, RoundedCornerShape(14.dp))
@@ -10297,29 +10791,29 @@ private fun MyPageScreen(user: ApiUser?, api: KarotterApi, themeKey: String, fol
                         Modifier.size(64.dp).background(PaleCarrot, RoundedCornerShape(22.dp)),
                         contentAlignment = Alignment.Center
                     ) {
-                        if (user.avatarUrl != null) {
-                            AsyncImage(user.avatarUrl, user.displayName, Modifier.fillMaxSize().clip(RoundedCornerShape(22.dp)), contentScale = ContentScale.Crop)
+                        if (rootUser.avatarUrl != null) {
+                            AsyncImage(rootUser.avatarUrl, rootUser.displayName, Modifier.fillMaxSize().clip(RoundedCornerShape(22.dp)), contentScale = ContentScale.Crop)
                         } else {
-                            KText(user.displayName.ifBlank { user.username }.take(1), 22, Ink, FontWeight.Black)
+                            KText(rootUser.displayName.ifBlank { rootUser.username }.take(1), 22, Ink, FontWeight.Black)
                         }
                     }
                     Spacer(Modifier.width(14.dp))
                     Column(Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            KText(user.displayName.ifBlank { user.username }, 18, OnStrong, FontWeight.Black, maxLines = 1, modifier = Modifier.weight(1f, fill = false))
-                            if (user.isPrivate) {
+                            KText(rootUser.displayName.ifBlank { rootUser.username }, 18, OnStrong, FontWeight.Black, maxLines = 1, modifier = Modifier.weight(1f, fill = false))
+                            if (rootUser.isPrivate) {
                                 Spacer(Modifier.width(6.dp))
                                 CustomIcon(IconType.LOCK, Carrot, 15.dp)
                             }
                         }
-                        KText("@${user.username}", 11, OnStrong.copy(.62f), maxLines = 1)
+                        KText("@${rootUser.username}", 11, OnStrong.copy(.62f), maxLines = 1)
                         Spacer(Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                            user.level?.let { level ->
+                            rootUser.level?.let { level ->
                                 KText("Lv.$level", 9, Carrot, FontWeight.Black, modifier = Modifier.background(OnStrong.copy(.1f), RoundedCornerShape(7.dp)).padding(horizontal = 7.dp, vertical = 4.dp))
                             }
                             KText(
-                                if (user.isPrivate) "非公開" else "公開",
+                                if (rootUser.isPrivate) "非公開" else "公開",
                                 9,
                                 OnStrong,
                                 FontWeight.Bold,
@@ -10341,9 +10835,9 @@ private fun MyPageScreen(user: ApiUser?, api: KarotterApi, themeKey: String, fol
                 Box(Modifier.fillMaxWidth().height(1.dp).background(OnStrong.copy(.12f)))
                 Spacer(Modifier.height(13.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    KText("${user.postsCount} 投稿", 10, OnStrong.copy(.72f), FontWeight.Bold)
-                    KText("${user.followingCount} フォロー", 10, OnStrong.copy(.72f), FontWeight.Bold)
-                    KText("${user.followersCount} フォロワー", 10, OnStrong.copy(.72f), FontWeight.Bold)
+                    KText("${rootUser.postsCount} 投稿", 10, OnStrong.copy(.72f), FontWeight.Bold)
+                    KText("${rootUser.followingCount} フォロー", 10, OnStrong.copy(.72f), FontWeight.Bold)
+                    KText("${rootUser.followersCount} フォロワー", 10, OnStrong.copy(.72f), FontWeight.Bold)
                 }
             }
         }
@@ -10363,7 +10857,7 @@ private fun MyPageScreen(user: ApiUser?, api: KarotterApi, themeKey: String, fol
         item {
             MyPageGroupCard {
                 MyPageRow("外観テーマ", "${themeFamily.replaceFirstChar { c -> c.uppercase() }} · ${if (followsSystemTheme) "端末に合わせる" else if (darkMode) "ダーク" else "ライト"}", "◐") { page = "appearance" }
-                if (user.subscriptionPlan.equals("PRO", true) && user.subscriptionStatus.equals("ACTIVE", true)) {
+                if (rootUser.subscriptionPlan.equals("PRO", true) && rootUser.subscriptionStatus.equals("ACTIVE", true)) {
                     MyPageDivider()
                     MyPageRow("Pro設定", "プロフィールと投稿カードの装飾", "proSettings") { page = "proSettings" }
                 }
@@ -12245,6 +12739,90 @@ private fun SendQuestionDialog(
     }
 }
 
+@Composable
+private fun ProfileShareDialog(user: ApiUser, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val url = remember(user.username) { profileWebUrl(user.username) }
+    val qrCode = remember(url) { generateQrCode(url) }
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(26.dp)).background(Surface)
+                .border(1.dp, Hairline, RoundedCornerShape(26.dp)).padding(22.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    KText("プロフィールを共有", 18, Ink, FontWeight.Black)
+                    KText("@${user.username}", 10, Muted)
+                }
+                Box(
+                    Modifier.size(34.dp).border(1.dp, Hairline, CircleShape).clickable { onDismiss() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    CustomIcon(IconType.CLOSE, Ink, 15.dp)
+                }
+            }
+            Spacer(Modifier.height(18.dp))
+            Box(
+                Modifier.size(224.dp).clip(RoundedCornerShape(20.dp)).background(Color.White)
+                    .border(1.dp, Hairline, RoundedCornerShape(20.dp)).padding(14.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                if (qrCode != null) {
+                    Image(
+                        bitmap = qrCode,
+                        contentDescription = "${user.displayName}のプロフィールQRコード",
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    KText("QRコードを生成できませんでした", 10, Muted)
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Paper)
+                    .border(1.dp, Hairline, RoundedCornerShape(14.dp))
+                    .clickable {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("プロフィールURL", url))
+                        Toast.makeText(context, "プロフィールURLをコピーしました", Toast.LENGTH_SHORT).show()
+                    }
+                    .padding(horizontal = 13.dp, vertical = 11.dp)
+            ) {
+                KText("プロフィールURL", 9, Muted, FontWeight.Bold)
+                Spacer(Modifier.height(3.dp))
+                KText(url, 11, Ink, FontWeight.Medium, maxLines = 2)
+            }
+            Spacer(Modifier.height(12.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                Box(
+                    Modifier.weight(1f).clip(RoundedCornerShape(13.dp))
+                        .border(1.dp, Hairline, RoundedCornerShape(13.dp))
+                        .clickable {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(ClipData.newPlainText("プロフィールURL", url))
+                            Toast.makeText(context, "コピーしました", Toast.LENGTH_SHORT).show()
+                        }.padding(vertical = 12.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    KText("URLをコピー", 11, Ink, FontWeight.Black)
+                }
+                Box(
+                    Modifier.weight(1f).clip(RoundedCornerShape(13.dp)).background(Carrot)
+                        .clickable { openShareMenu(context, "プロフィールを共有", url) }
+                        .padding(vertical = 12.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        CustomIcon(IconType.SHARE, Color.White, 15.dp)
+                        KText("共有", 11, Color.White, FontWeight.Black)
+                    }
+                }
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, onBack: (() -> Unit)?, onLogout: (() -> Unit)?, onPost: (Post) -> Unit, onReply: (Post) -> Unit, onQuote: (Post) -> Unit, onRekarot: (Post, Boolean) -> Unit, onLike: (Post, Boolean) -> Unit, onBookmark: (Post, Boolean) -> Unit, onCompose: (() -> Unit)? = null, onUser: ((ApiUser) -> Unit)? = null, viewerUserId: Long? = null, onDm: ((ApiUser) -> Unit)? = null, newOwnPost: Post? = null, onProfileReload: (() -> Unit)? = null, onEditProfile: (() -> Unit)? = null, retainedState: ProfilePageRetainedState? = null) {
@@ -12299,6 +12877,7 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
     var notificationError by remember(user.id) { mutableStateOf<String?>(null) }
     var questionDialogOpen by remember(user.id) { mutableStateOf(false) }
     var profileMoreOpen by remember(user.id) { mutableStateOf(false) }
+    var profileShareOpen by remember(user.id) { mutableStateOf(false) }
     var visibleFollowers by remember(user.id) { mutableIntStateOf(user.followersCount) }
     val listState = pageState.listState
     val profileScope = rememberCoroutineScope()
@@ -12460,6 +13039,9 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
             onDismiss = { questionDialogOpen = false }
         )
     }
+    if (profileShareOpen) {
+        ProfileShareDialog(user = user, onDismiss = { profileShareOpen = false })
+    }
     if (profileMoreOpen) {
         val systemNavigationClearance =
             WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding() + 36.dp
@@ -12494,6 +13076,14 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
                         ) { CustomIcon(IconType.CLOSE, Ink, 16.dp) }
                     }
                     Spacer(Modifier.height(14.dp))
+                    ProfileMoreActionRow(
+                        icon = IconType.SHARE,
+                        title = "プロフィールURL・QRコード",
+                        description = "URLを表示してプロフィールを共有"
+                    ) {
+                        profileMoreOpen = false
+                        profileShareOpen = true
+                    }
                     if (!blocked && user.questionsEnabled) {
                         ProfileMoreActionRow(
                             icon = IconType.QUESTION,
@@ -12694,6 +13284,15 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
                     }
                     Spacer(Modifier.weight(1f))
                     if (isOwn && onEditProfile != null) {
+                        Box(
+                            Modifier.size(profileActionSize).clip(RoundedCornerShape(12.dp))
+                                .background(Surface).border(1.dp, Hairline, RoundedCornerShape(12.dp))
+                                .clickable { profileShareOpen = true },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CustomIcon(IconType.SHARE, Ink, 16.dp)
+                        }
+                        Spacer(Modifier.width(5.dp))
                         Box(
                             Modifier
                                 .height(profileActionSize)
@@ -12898,13 +13497,24 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
         stickyHeader(key = "profile-tabs") {
             Row(Modifier.fillMaxWidth().background(Surface)) {
                 profileTabs.forEach { (label, kind) ->
+                    val tabIcon = when (kind) {
+                        "posts" -> IconType.BOARD
+                        "replies" -> IconType.REPLY
+                        "media" -> IconType.IMAGE
+                        "likes" -> IconType.HEART
+                        else -> IconType.BOARD
+                    }
                     val indicatorWidth by animateDpAsState(
                         if (selectedKind == kind) 34.dp else 0.dp,
                         tween(260, easing = FastOutSlowInEasing),
                         label = "profileTabIndicator"
                     )
                     Column(Modifier.weight(1f).clickable { selectedKind = kind }.padding(top = 12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                        KText(label, 11, if (selectedKind == kind) Ink else Muted, FontWeight.Bold, maxLines = 1)
+                        val contentColor = if (selectedKind == kind) Ink else Muted
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                            CustomIcon(tabIcon, contentColor, 14.dp, selectedKind == kind)
+                            KText(label, 11, contentColor, FontWeight.Bold, maxLines = 1)
+                        }
                         Spacer(Modifier.height(10.dp))
                         Box(Modifier.width(indicatorWidth).height(3.dp).background(if (selectedKind == kind) Carrot else Color.Transparent, RoundedCornerShape(2.dp)))
                     }
@@ -13364,7 +13974,7 @@ private fun bottomDockContentInset(): Dp =
 private fun BottomDock(
     selected: Section,
     bottomPadding: Dp,
-    dmHasUnread: Boolean,
+    dmUnreadCount: Int,
     hazeState: HazeState,
     onSelect: (Section) -> Unit,
     modifier: Modifier = Modifier
@@ -13404,13 +14014,15 @@ private fun BottomDock(
             ),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Section.entries.forEach { DockItem(it, selected == it, it == Section.DM && dmHasUnread) { onSelect(it) } }
+            Section.entries.forEach {
+                DockItem(it, selected == it, if (it == Section.DM) dmUnreadCount else 0) { onSelect(it) }
+            }
         }
     }
 }
 
 @Composable
-private fun RowScope.DockItem(section: Section, selected: Boolean, hasBadge: Boolean, action: () -> Unit) {
+private fun RowScope.DockItem(section: Section, selected: Boolean, badgeCount: Int, action: () -> Unit) {
     val lift by animateDpAsState(if (selected) (-4).dp else 0.dp, spring(dampingRatio = .58f), label = "dockLift")
     Column(
         Modifier.weight(1f).offset(y = lift).clip(RoundedCornerShape(14.dp)).clickable { action() }.padding(vertical = 6.dp),
@@ -13428,12 +14040,19 @@ private fun RowScope.DockItem(section: Section, selected: Boolean, hasBadge: Boo
                 },
                 if (selected) Ink else Muted, 20.dp, selected
             )
-            if (hasBadge) {
+            if (badgeCount > 0) {
                 Box(
-                    Modifier.align(Alignment.TopEnd).size(8.dp)
+                    Modifier.align(Alignment.TopEnd)
+                        .offset(x = 5.dp, y = (-4).dp)
+                        .height(15.dp)
+                        .widthIn(min = 15.dp)
                         .background(Carrot, CircleShape)
                         .border(1.5.dp, Paper, CircleShape)
-                )
+                        .padding(horizontal = 3.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    KText(if (badgeCount > 99) "99+" else badgeCount.toString(), 7, Color.White, FontWeight.Black, maxLines = 1)
+                }
             }
         }
         Spacer(Modifier.height(4.dp))
@@ -13839,6 +14458,31 @@ private fun StoryComposerDialog(
     }
 }
 
+private class ComposerSyntaxHighlightTransformation(
+    private val mentionColor: Color,
+    private val hashtagColor: Color
+) : VisualTransformation {
+    override fun filter(text: AnnotatedString): TransformedText {
+        val highlighted = AnnotatedString.Builder(text.text).apply {
+            MentionPattern.findAll(text.text).forEach { match ->
+                addStyle(
+                    SpanStyle(color = mentionColor, fontWeight = FontWeight.Bold),
+                    match.range.first,
+                    match.range.last + 1
+                )
+            }
+            HashtagPattern.findAll(text.text).forEach { match ->
+                addStyle(
+                    SpanStyle(color = hashtagColor, fontWeight = FontWeight.Bold),
+                    match.range.first,
+                    match.range.last + 1
+                )
+            }
+        }.toAnnotatedString()
+        return TransformedText(highlighted, OffsetMapping.Identity)
+    }
+}
+
 @Composable
 private fun Composer(
     api: KarotterApi,
@@ -13851,6 +14495,12 @@ private fun Composer(
     onSubmit: (String, List<ComposerMedia>, List<String>, Int, ComposerSettings, (String?) -> Unit) -> Unit
 ) {
     val context = LocalContext.current
+    val syntaxHighlight = remember(Carrot) {
+        ComposerSyntaxHighlightTransformation(
+            mentionColor = Color(0xFF4385D1),
+            hashtagColor = Carrot
+        )
+    }
     var text by remember(question?.id) {
         mutableStateOf(
             question?.let { item ->
@@ -13870,6 +14520,7 @@ private fun Composer(
     var sending by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var confirmClose by remember { mutableStateOf(false) }
+    val backgroundInteractionSource = remember { MutableInteractionSource() }
     val mediaPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isEmpty()) return@rememberLauncherForActivityResult
         val picked = uris.map { uri ->
@@ -13970,7 +14621,15 @@ private fun Composer(
             }
         }
     }
-    Box(Modifier.fillMaxSize().background(Paper)) {
+    Box(
+        Modifier.fillMaxSize()
+            .background(Paper)
+            .clickable(
+                interactionSource = backgroundInteractionSource,
+                indication = null,
+                onClick = {}
+            )
+    ) {
         Column(Modifier.fillMaxSize().navigationBarsPadding().imePadding()) {
             Row(
                 Modifier.fillMaxWidth().background(Surface)
@@ -14088,6 +14747,7 @@ private fun Composer(
                         value = text,
                         onValueChange = { text = it.take(postCharacterLimit); error = null },
                         textStyle = TextStyle(Ink, 19.sp, FontWeight.Medium, lineHeight = 29.sp),
+                        visualTransformation = syntaxHighlight,
                         cursorBrush = androidx.compose.ui.graphics.SolidColor(Carrot),
                         modifier = Modifier.fillMaxWidth().weight(1f),
                         decorationBox = { inner ->
@@ -14114,6 +14774,9 @@ private fun Composer(
                                 ) {
                                     if (item.mimeType.startsWith("image/")) {
                                         AsyncImage(item.uri, item.name, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                                        if (item.spoiler) {
+                                            Box(Modifier.fillMaxSize().background(Color.Black.copy(.3f)))
+                                        }
                                     } else {
                                         Column(
                                             Modifier.fillMaxSize().padding(9.dp),
@@ -14123,6 +14786,24 @@ private fun Composer(
                                             KText("▶", 19, OnStrong, FontWeight.Black)
                                             Spacer(Modifier.height(5.dp))
                                             KText(item.name, 8, OnStrong.copy(.72f), maxLines = 2)
+                                        }
+                                    }
+                                    if (item.mimeType.startsWith("image/")) {
+                                        Row(
+                                            Modifier.align(Alignment.BottomStart).padding(5.dp)
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .background(if (item.spoiler) Carrot else Paper.copy(.9f))
+                                                .clickable {
+                                                    selectedMedia = selectedMedia.map { selected ->
+                                                        if (selected.uri == item.uri) selected.copy(spoiler = !selected.spoiler) else selected
+                                                    }
+                                                }
+                                                .padding(horizontal = 7.dp, vertical = 5.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                        ) {
+                                            CustomIcon(IconType.EYE, if (item.spoiler) Color.White else Ink, 11.dp)
+                                            KText("スポイラー", 7, if (item.spoiler) Color.White else Ink, FontWeight.Black)
                                         }
                                     }
                                     Box(
@@ -14336,6 +15017,8 @@ private fun ComposerSettingsDialog(
         validationError = when {
             visibility == "CIRCLE" && viewerCircleId == null -> "公開するサークルを選択してください"
             replyRestriction == "CIRCLE" && replyCircleId == null -> "返信可能なサークルを選択してください"
+            minimumAge != null && minimumAge !in 0..150 -> "最低年齢は0〜150歳で入力してください"
+            maximumAge != null && maximumAge !in 0..150 -> "最高年齢は0〜150歳で入力してください"
             minimumAge != null && maximumAge != null && minimumAge!! > maximumAge!! -> "年齢制限の上限は下限以上にしてください"
             scheduledEnabled && scheduled == null -> "予約日時を yyyy/MM/dd HH:mm 形式で入力してください"
             scheduled != null && !scheduled.isAfter(now) -> "予約日時は現在より後にしてください"
@@ -14578,23 +15261,47 @@ private fun CommunityDestinationChoices(
 
 @Composable
 private fun SettingsNullableNumberRow(values: List<Int>, selected: Int?, onSelect: (Int?) -> Unit) {
-    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        item {
-            val active = selected == null
-            Box(
-                Modifier.clip(RoundedCornerShape(10.dp)).background(if (active) Strong else Surface)
-                    .border(1.dp, if (active) Strong else Hairline, RoundedCornerShape(10.dp))
-                    .clickable { onSelect(null) }.padding(horizontal = 10.dp, vertical = 7.dp)
-            ) { KText("なし", 8, if (active) OnStrong else Muted, FontWeight.Bold) }
+    Column {
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            item {
+                val active = selected == null
+                Box(
+                    Modifier.clip(RoundedCornerShape(10.dp)).background(if (active) Strong else Surface)
+                        .border(1.dp, if (active) Strong else Hairline, RoundedCornerShape(10.dp))
+                        .clickable { onSelect(null) }.padding(horizontal = 10.dp, vertical = 7.dp)
+                ) { KText("なし", 8, if (active) OnStrong else Muted, FontWeight.Bold) }
+            }
+            items(values) { age ->
+                val active = selected == age
+                Box(
+                    Modifier.clip(RoundedCornerShape(10.dp)).background(if (active) Strong else Surface)
+                        .border(1.dp, if (active) Strong else Hairline, RoundedCornerShape(10.dp))
+                        .clickable { onSelect(age) }.padding(horizontal = 10.dp, vertical = 7.dp)
+                ) { KText("${age}歳", 8, if (active) OnStrong else Muted, FontWeight.Bold) }
+            }
         }
-        items(values) { age ->
-            val active = selected == age
-            Box(
-                Modifier.clip(RoundedCornerShape(10.dp)).background(if (active) Strong else Surface)
-                    .border(1.dp, if (active) Strong else Hairline, RoundedCornerShape(10.dp))
-                    .clickable { onSelect(age) }.padding(horizontal = 10.dp, vertical = 7.dp)
-            ) { KText("${age}歳", 8, if (active) OnStrong else Muted, FontWeight.Bold) }
-        }
+        Spacer(Modifier.height(7.dp))
+        val customValue = selected?.takeUnless { it in values }?.toString().orEmpty()
+        BasicTextField(
+            value = customValue,
+            onValueChange = { input ->
+                val digits = input.filter(Char::isDigit).take(3)
+                onSelect(digits.toIntOrNull())
+            },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            textStyle = TextStyle(Ink, 11.sp, FontWeight.Medium),
+            cursorBrush = androidx.compose.ui.graphics.SolidColor(Carrot),
+            modifier = Modifier.fillMaxWidth().height(40.dp).background(Surface, RoundedCornerShape(11.dp))
+                .border(1.dp, if (customValue.isNotEmpty()) Carrot else Hairline, RoundedCornerShape(11.dp))
+                .padding(horizontal = 11.dp),
+            decorationBox = { inner ->
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                    if (customValue.isEmpty()) KText("カスタム年齢を入力", 10, Muted)
+                    inner()
+                }
+            }
+        )
     }
 }
 
@@ -14656,7 +15363,7 @@ private enum class IconType {
     LOCK, PIN, POLL, CONTROLS, CALENDAR, REFRESH, CHEVRON_UP, CHEVRON_DOWN,
     PLUS, BACK, CLOSE, SEND, CHECK, REKAROT, FORWARD, EYE,
     THEME, LICENSE, INFO, LOGOUT, PROFILE_EDIT, ACCOUNT_SWITCH, VOLUME_ON, VOLUME_OFF, BLOCK, MORE, VERIFIED,
-    LINK, MAP_PIN, QUESTION
+    LINK, MAP_PIN, QUESTION, SHARE
 }
 
 @Composable
@@ -14707,6 +15414,7 @@ private fun CustomIcon(type: IconType, color: Color, size: Dp, filled: Boolean =
         IconType.LINK -> PhosphorIcons.Regular.LinkSimple
         IconType.MAP_PIN -> PhosphorIcons.Regular.MapPin
         IconType.QUESTION -> PhosphorIcons.Regular.ChatCircle
+        IconType.SHARE -> PhosphorIcons.Regular.ShareNetwork
     }
     Image(
         imageVector = vector,
@@ -14813,10 +15521,11 @@ private val HashtagPattern = Regex("(?<![\\w/#])#([\\p{L}\\p{N}_]{1,50})")
 private val SingleDollarMathPattern = Regex("(?<!\\$)\\$([^\\n$]+)\\$(?!\\$)")
 private val InlineLatexPattern = Regex("\\\\\\((.+?)\\\\\\)")
 private val BlockLatexPattern = Regex("\\\\\\[([\\s\\S]+?)\\\\]")
-private val ProtectedMarkdownPattern = Regex("(?s)(```.*?```|`[^`\\n]*`|\\$\\$.*?\\$\\$)")
+private val ProtectedMarkdownPattern = Regex("(?s)(```.*?```|`[^`\\n]*`|\\$\\$.*?\\$\\$|\\|\\|.*?\\|\\|)")
 private val ProtectedMarkdownTokenPattern = Regex("\\uE000(\\d+)\\uE001")
 private val QuotedRubyPattern = Regex("\"([^\"\\n]{1,60})\"《([^《》\\n]{1,80})》")
 private val BarRubyPattern = Regex("[|｜]([^《\\n]{1,60})《([^《》\\n]{1,80})》")
+private val TextSpoilerPattern = Regex("\\|\\|([\\s\\S]+?)\\|\\|")
 
 private fun richMarkdown(source: String): String {
     var value = source.take(20_000)
@@ -14869,6 +15578,58 @@ private fun applyRubySpans(view: TextView, textColor: Int, textSizePx: Float) {
         )
     }
     view.text = builder
+}
+
+private fun applyTextSpoilerSpans(
+    view: TextView,
+    textColor: Int,
+    hiddenColor: Int,
+    revealedSpoilers: Set<Int>,
+    onToggle: (Int, Boolean) -> Unit
+) {
+    val matches = TextSpoilerPattern.findAll(view.text.toString()).toList()
+    if (matches.isEmpty()) return
+    val builder = SpannableStringBuilder(view.text)
+    matches.withIndex().toList().asReversed().forEach { (index, match) ->
+        val content = match.groupValues[1]
+        val start = match.range.first
+        val endExclusive = match.range.last + 1
+        builder.delete(endExclusive - 2, endExclusive)
+        builder.delete(start, start + 2)
+        builder.setSpan(
+            TextSpoilerSpan(
+                revealed = index in revealedSpoilers,
+                textColor = textColor,
+                hiddenColor = hiddenColor,
+                onToggle = { revealed -> onToggle(index, revealed) }
+            ),
+            start,
+            start + content.length,
+            Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+        )
+    }
+    view.text = builder
+}
+
+private class TextSpoilerSpan(
+    private val revealed: Boolean,
+    private val textColor: Int,
+    private val hiddenColor: Int,
+    private val onToggle: (Boolean) -> Unit
+) : ClickableSpan() {
+    override fun updateDrawState(ds: TextPaint) {
+        ds.isUnderlineText = false
+        ds.color = if (revealed) textColor else hiddenColor
+        ds.bgColor = if (revealed) android.graphics.Color.TRANSPARENT else hiddenColor
+    }
+
+    override fun onClick(widget: android.view.View) {
+        onToggle(!revealed)
+        (widget as? TextView)?.text?.let { text ->
+            if (text is Spannable) Selection.removeSelection(text)
+        }
+        widget.invalidate()
+    }
 }
 
 private class RubySpan(
@@ -14943,6 +15704,7 @@ private fun RichContentText(
     val density = LocalDensity.current
     val textPx = with(density) { size.sp.toPx() }
     val lineExtra = with(density) { (lineHeight - size).coerceAtLeast(0f).sp.toPx() }
+    val revealedSpoilers = remember(text) { mutableStateMapOf<Int, Boolean>() }
     val markwon = remember(context, textPx, color, mentionHandler, hashtagHandler) {
         Markwon.builder(context)
             .usePlugin(MarkwonInlineParserPlugin.create())
@@ -14974,7 +15736,13 @@ private fun RichContentText(
     }
     AndroidView(
         modifier = modifier,
-        factory = { ctx -> TextView(ctx).apply { includeFontPadding = false; setBackgroundColor(android.graphics.Color.TRANSPARENT) } },
+        factory = { ctx ->
+            TextView(ctx).apply {
+                includeFontPadding = false
+                highlightColor = android.graphics.Color.TRANSPARENT
+                setBackgroundColor(android.graphics.Color.TRANSPARENT)
+            }
+        },
         update = { view ->
             view.setTextColor(color.toArgb())
             view.setLinkTextColor(Carrot.toArgb())
@@ -14985,9 +15753,18 @@ private fun RichContentText(
             runCatching {
                 markwon.setMarkdown(view, richMarkdown(text))
                 applyRubySpans(view, color.toArgb(), textPx)
+                applyTextSpoilerSpans(
+                    view = view,
+                    textColor = color.toArgb(),
+                    hiddenColor = Muted.toArgb(),
+                    revealedSpoilers = revealedSpoilers.filterValues { it }.keys,
+                    onToggle = { index, revealed ->
+                        if (revealed) revealedSpoilers[index] = true else revealedSpoilers.remove(index)
+                    }
+                )
             }
                 .onFailure { view.text = text.take(20_000) }
-            if (onPlainTextClick != null) {
+            if (onPlainTextClick != null || TextSpoilerPattern.containsMatchIn(text)) {
                 val current = view.movementMethod
                 if (current is RichContentMovementMethod) {
                     current.onPlainTextClick = onPlainTextClick

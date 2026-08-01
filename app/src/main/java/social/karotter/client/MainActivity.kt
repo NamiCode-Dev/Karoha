@@ -13,6 +13,7 @@ import social.karotter.client.ui.KarotterApp
 data class NotificationNavigationTarget(
     val postId: Long? = null,
     val username: String? = null,
+    val dmGroupId: Long? = null,
     val nonce: Long = System.nanoTime()
 )
 
@@ -56,15 +57,18 @@ class MainActivity : ComponentActivity() {
     private fun readNotificationTarget(intent: Intent?) {
         val postId = intent?.getLongExtra(EXTRA_NOTIFICATION_POST_ID, -1L)?.takeIf { it > 0L }
         val username = intent?.getStringExtra(EXTRA_NOTIFICATION_USERNAME)?.takeIf { it.isNotBlank() }
-        if (postId != null || username != null) {
-            notificationTarget = NotificationNavigationTarget(postId, username)
+        val dmGroupId = intent?.getLongExtra(EXTRA_NOTIFICATION_DM_GROUP_ID, -1L)?.takeIf { it > 0L }
+        if (postId != null || username != null || dmGroupId != null) {
+            notificationTarget = NotificationNavigationTarget(postId, username, dmGroupId)
             intent?.removeExtra(EXTRA_NOTIFICATION_POST_ID)
             intent?.removeExtra(EXTRA_NOTIFICATION_USERNAME)
+            intent?.removeExtra(EXTRA_NOTIFICATION_DM_GROUP_ID)
         }
     }
 
     companion object {
         const val EXTRA_NOTIFICATION_POST_ID = "karoha.notification.POST_ID"
         const val EXTRA_NOTIFICATION_USERNAME = "karoha.notification.USERNAME"
+        const val EXTRA_NOTIFICATION_DM_GROUP_ID = "karoha.notification.DM_GROUP_ID"
     }
 }

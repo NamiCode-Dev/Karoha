@@ -101,7 +101,12 @@ data class ApiPoll(
     val ownVoteOptionId: Long?,
     val options: List<ApiPollOption>
 )
-data class ApiUploadMedia(val fileName: String, val mimeType: String, val bytes: ByteArray)
+data class ApiUploadMedia(
+    val fileName: String,
+    val mimeType: String,
+    val bytes: ByteArray,
+    val spoiler: Boolean = false
+)
 
 data class ApiPost(
     val id: Long,
@@ -1535,7 +1540,7 @@ class KarotterApi(context: Context) {
         }
         val suppressedUnreadCount = recentNotifications
             .asSequence()
-            .filter { it.suppressed && !it.isRead }
+            .filter { (it.suppressed || it.type.equals("DM", ignoreCase = true)) && !it.isRead }
             .sumOf(ApiNotification::notificationCount)
         return ApiResult.Success((serverCount - suppressedUnreadCount).coerceAtLeast(0))
     }
@@ -1883,7 +1888,7 @@ class KarotterApi(context: Context) {
         val fields = linkedMapOf(
             "content" to content,
             "mediaAlts" to JSONArray(media.map { "" }).toString(),
-            "mediaSpoilerFlags" to JSONArray(media.map { false }).toString(),
+            "mediaSpoilerFlags" to JSONArray(media.map(ApiUploadMedia::spoiler)).toString(),
             "mediaR18Flags" to JSONArray(media.map { false }).toString(),
             "isAiGenerated" to isAiGenerated.toString(),
             "isPromotional" to isPromotional.toString(),
@@ -2450,6 +2455,21 @@ class KarotterApi(context: Context) {
     }
 
     private fun parseUser(json: JSONObject): ApiUser {
+        fun userCount(vararg names: String): Int {
+            val sources = listOfNotNull(json, json.optJSONObject("_count"), json.optJSONObject("counts"))
+            for (source in sources) {
+                for (name in names) {
+                    if (!source.has(name) || source.isNull(name)) continue
+                    val parsed = when (val value = source.opt(name)) {
+                        is Number -> value.toInt()
+                        is String -> value.toIntOrNull()
+                        else -> null
+                    }
+                    if (parsed != null) return parsed.coerceAtLeast(0)
+                }
+            }
+            return 0
+        }
         val rawMark = json.opt("officialMark")
         val officialMarks = when (rawMark) {
             is JSONArray -> buildList {
@@ -2539,7 +2559,10 @@ class KarotterApi(context: Context) {
         return ApiUser(
             json.optLong("id"), json.optString("username"), json.optString("displayName", json.optString("username", "Karotter user")),
             absolute(json.optString("avatarUrl")), absolute(json.optString("headerUrl")), json.optString("bio"), absolute(json.optString("websiteUrl")), json.optBoolean("showLikedPosts", false),
-            json.optInt("followersCount"), json.optInt("followingCount"), json.optInt("postsCount"), officialMark,
+            userCount("followersCount", "followerCount", "followers"),
+            userCount("followingCount", "followCount", "following"),
+            userCount("postsCount", "postCount", "posts"),
+            officialMark,
             json.optBoolean("isBotAccount", json.optBoolean("isBot")),
             json.optBoolean("isParodyAccount", json.optBoolean("isParody")),
             json.optBoolean("isFollowing", json.optBoolean("is_following")),

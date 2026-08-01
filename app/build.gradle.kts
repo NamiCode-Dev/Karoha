@@ -12,8 +12,8 @@ android {
         applicationId = "social.karotter.client"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.1.5"
+        versionCode = 8
+        versionName = "0.1.6"
     }
 
     buildFeatures { compose = true }
@@ -38,6 +38,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-process:2.8.7")
     implementation("com.adamglin:phosphor-icon:1.0.0")
+    implementation("com.google.zxing:core:3.5.3")
     implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("io.coil-kt:coil-gif:2.7.0")
     implementation("org.conscrypt:conscrypt-android:2.5.3")
