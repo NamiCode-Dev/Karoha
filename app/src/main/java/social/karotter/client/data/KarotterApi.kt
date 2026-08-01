@@ -9,6 +9,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.time.Instant
 import java.util.UUID
 
 private const val API_BASE = "https://api.karotter.com/api/"
@@ -75,7 +76,36 @@ data class ApiUser(
     val hideProfileFromMinors: Boolean = false,
     val profileUnavailableReason: String? = null,
     val profileUnavailableDetails: List<String> = emptyList(),
-    val postCharacterLimit: Int = 200
+    val postCharacterLimit: Int = 200,
+    val showReactions: Boolean = true,
+    val levelEnabled: Boolean = true
+)
+
+data class ApiAccountSettings(
+    val isPrivate: Boolean = false,
+    val showLikedPosts: Boolean = true,
+    val showReadReceipts: Boolean = true,
+    val directMessagesEnabled: Boolean = true,
+    val questionsEnabled: Boolean = true,
+    val giftsEnabled: Boolean = true,
+    val onlineStatusVisibility: String = "PUBLIC",
+    val dmRequestPolicy: String = "EVERYONE",
+    val defaultExcludeReplyTargets: Boolean = false,
+    val showReactions: Boolean = true,
+    val levelEnabled: Boolean = true,
+    val showHiddenPosts: Boolean = false,
+    val showParodyAccounts: Boolean = true,
+    val showBotAccounts: Boolean = true,
+    val showR18Content: Boolean = false,
+    val showRepliesInTimeline: Boolean = false,
+    val showRekarotsInTimeline: Boolean = true,
+    val hideUnfollowedRekarotsInTimeline: Boolean = false,
+    val isParodyAccount: Boolean = false,
+    val isBotAccount: Boolean = false,
+    val hideProfileFromMinors: Boolean = false,
+    val profileMinimumAge: Int? = null,
+    val profileMaximumAge: Int? = null,
+    val mutedKeywords: List<String> = emptyList()
 )
 
 data class ApiMedia(
@@ -524,6 +554,56 @@ class KarotterApi(context: Context) {
         return result
     }
 
+    fun accountSettings(): ApiResult<ApiAccountSettings> = mapObject(request("auth/me")) { root ->
+        val user = root.optJSONObject("user") ?: root
+        val keywords = buildList {
+            val array = user.optJSONArray("mutedKeywords") ?: JSONArray()
+            for (index in 0 until array.length()) {
+                array.optString(index).trim().takeIf(String::isNotBlank)?.let(::add)
+            }
+        }.distinct()
+        ApiAccountSettings(
+            isPrivate = user.optBoolean("isPrivate"),
+            showLikedPosts = user.optBoolean("showLikedPosts", true),
+            showReadReceipts = user.optBoolean("showReadReceipts", true),
+            directMessagesEnabled = user.optBoolean("directMessagesEnabled", true),
+            questionsEnabled = user.optBoolean("questionsEnabled", true),
+            giftsEnabled = user.optBoolean("giftsEnabled", true),
+            onlineStatusVisibility = user.optString("onlineStatusVisibility", "PUBLIC"),
+            dmRequestPolicy = user.optString("dmRequestPolicy", "EVERYONE"),
+            defaultExcludeReplyTargets = user.optBoolean("defaultExcludeReplyTargets"),
+            showReactions = user.optBoolean("showReactions", true),
+            levelEnabled = user.optBoolean("levelEnabled", true),
+            showHiddenPosts = user.optBoolean("showHiddenPosts"),
+            showParodyAccounts = user.optBoolean("showParodyAccounts", true),
+            showBotAccounts = user.optBoolean("showBotAccounts", true),
+            showR18Content = user.optBoolean("showR18Content"),
+            showRepliesInTimeline = user.optBoolean("showRepliesInTimeline"),
+            showRekarotsInTimeline = user.optBoolean("showRekarotsInTimeline", true),
+            hideUnfollowedRekarotsInTimeline = user.optBoolean("hideUnfollowedRekarotsInTimeline"),
+            isParodyAccount = user.optBoolean("isParodyAccount"),
+            isBotAccount = user.optBoolean("isBotAccount"),
+            hideProfileFromMinors = user.optBoolean("hideProfileFromMinors"),
+            profileMinimumAge = user.optNullableInt("profileMinimumAge"),
+            profileMaximumAge = user.optNullableInt("profileMaximumAge"),
+            mutedKeywords = keywords
+        )
+    }
+
+    fun updateAccountSettings(values: Map<String, Any?>): ApiResult<Unit> {
+        val body = JSONObject()
+        values.forEach { (key, value) -> body.put(key, value ?: JSONObject.NULL) }
+        return mapObject(request("users/settings", "PATCH", body.toString(), needsCsrf = true)) { Unit }
+    }
+
+    fun mutedUsers(): ApiResult<List<ApiUser>> = mapObject(request("follow/mute")) { root ->
+        parseUsers(root.optJSONArray("users") ?: root.optJSONArray("items"))
+    }
+
+    fun blockedUsers(): ApiResult<List<ApiUser>> = mapObject(request("follow/block")) { root ->
+        parseUsers(root.optJSONArray("users") ?: root.optJSONArray("items"))
+    }
+
     fun user(username: String): ApiResult<ApiUser> = mapObject(request("users/${encode(username)}")) { root ->
         val source = root.optJSONObject("user") ?: root
         mergeLevelData(source, root)
@@ -941,6 +1021,36 @@ class KarotterApi(context: Context) {
                     )
                 )
             }
+        }
+    }
+
+    fun createCircle(name: String): ApiResult<ApiCircle> {
+        val normalizedName = name.trim()
+        if (normalizedName.isBlank()) return ApiResult.Failure("サークル名を入力してください")
+        val created = request(
+            "social/circles",
+            "POST",
+            JSONObject().put("name", normalizedName).toString(),
+            needsCsrf = true
+        )
+        if (created is ApiResult.Failure) return created
+        val root = (created as ApiResult.Success).value
+        val item = root.optJSONObject("circle") ?: root.optJSONObject("item") ?: root
+        val id = item.optLong("id")
+        if (id > 0L) {
+            return ApiResult.Success(
+                ApiCircle(
+                    id = id,
+                    name = item.optString("name", item.optString("title", normalizedName)),
+                    memberCount = item.optInt("memberCount", item.optInt("membersCount"))
+                )
+            )
+        }
+        return when (val refreshed = circles()) {
+            is ApiResult.Success -> refreshed.value.firstOrNull { it.name == normalizedName }
+                ?.let { ApiResult.Success(it) }
+                ?: ApiResult.Failure("サークルを作成しましたが、作成結果を取得できませんでした")
+            is ApiResult.Failure -> refreshed
         }
     }
 
@@ -1908,7 +2018,20 @@ class KarotterApi(context: Context) {
         minimumAge?.let { fields["minimumAge"] = it.toString() }
         maximumAge?.let { fields["maximumAge"] = it.toString() }
         scheduledFor?.takeIf(String::isNotBlank)?.let { fields["scheduledFor"] = it }
-        expiresAt?.takeIf(String::isNotBlank)?.let { fields["expiresAt"] = it }
+        expiresAt?.takeIf(String::isNotBlank)?.let { expiresAtValue ->
+            val expiration = runCatching { Instant.parse(expiresAtValue) }.getOrNull()
+            val expirationBase = scheduledFor
+                ?.takeIf(String::isNotBlank)
+                ?.let { runCatching { Instant.parse(it) }.getOrNull() }
+                ?: Instant.now()
+            expiration?.let {
+                val durationMillis = it.toEpochMilli() - expirationBase.toEpochMilli()
+                if (durationMillis > 0L) {
+                    val durationHours = ((durationMillis + 3_599_999L) / 3_600_000L).coerceAtLeast(1L)
+                    fields["expirationDurationHours"] = durationHours.toString()
+                }
+            }
+        }
         pollOptions.map(String::trim).filter(String::isNotBlank).takeIf { it.size >= 2 }?.let { options ->
             fields["pollOptions"] = JSONArray(options).toString()
             fields["pollDurationHours"] = pollDurationHours.coerceIn(1, 168).toString()
@@ -2629,7 +2752,9 @@ class KarotterApi(context: Context) {
                     "PRO" -> 1000
                     "PLUS" -> 500
                     else -> 200
-                }
+                },
+            json.optBoolean("showReactions", true),
+            json.optBoolean("levelEnabled", true)
         )
     }
 

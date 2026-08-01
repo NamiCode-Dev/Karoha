@@ -25,6 +25,13 @@ data class AppUpdateInfo(
     val releaseUrl: String
 )
 
+data class AppReleaseNotes(
+    val tagName: String,
+    val title: String,
+    val notes: String,
+    val releaseUrl: String
+)
+
 sealed interface InstallApkResult {
     data object Launched : InstallApkResult
     data object PermissionRequired : InstallApkResult
@@ -35,6 +42,24 @@ object AppUpdateManager {
     private const val LATEST_RELEASE_URL =
         "https://api.github.com/repos/NamiCode-Dev/Karoha/releases/latest"
     private const val USER_AGENT = "Karoha-Android-Updater"
+
+    fun currentVersionName(context: Context): String =
+        packageInfo(context, context.packageName)?.versionName.orEmpty()
+
+    fun installedVersionReleaseNotes(context: Context): Result<AppReleaseNotes> = runCatching {
+        val version = currentVersionName(context).removePrefix("v").trim()
+        require(version.isNotBlank()) { "アプリのバージョンを確認できませんでした" }
+        val release = sequenceOf("v$version", version)
+            .mapNotNull { tag -> releaseByTag(tag) }
+            .firstOrNull()
+            ?: error("GitHub Release v$version がまだ公開されていません")
+        AppReleaseNotes(
+            tagName = release.optString("tag_name", "v$version"),
+            title = release.optString("name").takeIf { it.isNotBlank() } ?: "Karoha v$version",
+            notes = release.optString("body"),
+            releaseUrl = release.optString("html_url")
+        )
+    }
 
     fun checkForUpdate(context: Context): Result<AppUpdateInfo?> = runCatching {
         val connection = openConnection(LATEST_RELEASE_URL).apply {
@@ -85,6 +110,27 @@ object AppUpdateManager {
                 .takeIf { it.matches(Regex("[0-9a-fA-F]{64}")) },
             releaseUrl = root.optString("html_url")
         )
+    }
+
+    private fun releaseByTag(tag: String): JSONObject? {
+        val connection = openConnection(
+            "https://api.github.com/repos/NamiCode-Dev/Karoha/releases/tags/${Uri.encode(tag)}"
+        ).apply {
+            setRequestProperty("Accept", "application/vnd.github+json")
+            setRequestProperty("X-GitHub-Api-Version", "2022-11-28")
+        }
+        val status = connection.responseCode
+        if (status == HttpURLConnection.HTTP_NOT_FOUND) {
+            connection.disconnect()
+            return null
+        }
+        if (status !in 200..299) {
+            val message = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            connection.disconnect()
+            error("GitHub Releaseを取得できませんでした（HTTP $status）${message.take(160)}")
+        }
+        return connection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+            .also { connection.disconnect() }
     }
 
     fun downloadApk(

@@ -29,6 +29,8 @@ import android.text.TextPaint
 import android.text.TextUtils
 import android.text.method.LinkMovementMethod
 import android.text.style.ClickableSpan
+import android.text.style.ForegroundColorSpan
+import android.text.style.RelativeSizeSpan
 import android.text.style.ReplacementSpan
 import android.view.MotionEvent
 import android.widget.TextView
@@ -65,6 +67,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -126,7 +129,9 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.OffsetMapping
 import androidx.compose.ui.text.input.TransformedText
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.TextRange
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
@@ -280,6 +285,7 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
 import com.google.zxing.MultiFormatWriter
 import social.karotter.client.data.ApiBoard
+import social.karotter.client.data.ApiAccountSettings
 import social.karotter.client.data.ApiCircle
 import social.karotter.client.data.ApiCommunity
 import social.karotter.client.data.ApiCommunityGroups
@@ -313,6 +319,7 @@ import social.karotter.client.BackgroundNotificationManager
 import social.karotter.client.AppVisibility
 import social.karotter.client.AppUpdateInfo
 import social.karotter.client.AppUpdateManager
+import social.karotter.client.AppReleaseNotes
 import social.karotter.client.InstallApkResult
 import social.karotter.client.NotificationNavigationTarget
 import java.io.File
@@ -402,6 +409,8 @@ private val LocalPostMenuResultHandler = staticCompositionLocalOf<((PostMenuActi
 private val LocalNavigationActive = staticCompositionLocalOf { true }
 private val LocalLinkPreviewApi = staticCompositionLocalOf<KarotterApi?> { null }
 private val LocalViewerIsPro = staticCompositionLocalOf { false }
+private val LocalShowReactions = staticCompositionLocalOf { true }
+private val LocalPinnedHeaderHazeState = staticCompositionLocalOf<HazeState?> { null }
 
 private data class RekarotState(val rekaroted: Boolean, val count: Int)
 private data class PostInteractionState(
@@ -766,6 +775,11 @@ fun KarotterApp(
     var updateProgress by remember { mutableStateOf(0f) }
     var updateError by remember { mutableStateOf<String?>(null) }
     var downloadedUpdateApk by remember { mutableStateOf<File?>(null) }
+    val releaseNotesPrefs = remember {
+        context.getSharedPreferences("karoha_release_notes_v1", android.content.Context.MODE_PRIVATE)
+    }
+    var releaseNotesCheckStarted by remember { mutableStateOf(false) }
+    var currentReleaseNotes by remember { mutableStateOf<AppReleaseNotes?>(null) }
     val creatorPromptPrefs = remember {
         context.getSharedPreferences("karoha_creator_follow_prompt_v1", android.content.Context.MODE_PRIVATE)
     }
@@ -794,7 +808,7 @@ fun KarotterApp(
         val destinationReady = !onboardingComplete || !checking
         if (initialLaunchMinimumPassed && destinationReady && initialLaunchAnimationVisible && !initialLaunchAnimationExiting) {
             initialLaunchAnimationExiting = true
-            delay(320L)
+            delay(420L)
             initialLaunchAnimationVisible = false
         }
     }
@@ -810,6 +824,25 @@ fun KarotterApp(
                 updateError = null
             }
         }
+    }
+
+    LaunchedEffect(networkAvailable, initialLaunchAnimationVisible, onboardingComplete) {
+        val installedVersion = AppUpdateManager.currentVersionName(context).removePrefix("v")
+        if (!onboardingComplete) {
+            // 新規インストールは更新後ではないため、更新内容ダイアログを表示しない。
+            if (installedVersion.isNotBlank()) {
+                releaseNotesPrefs.edit().putString("shown_version", installedVersion).apply()
+            }
+            return@LaunchedEffect
+        }
+        if (!networkAvailable || initialLaunchAnimationVisible || releaseNotesCheckStarted || installedVersion.isBlank()) {
+            return@LaunchedEffect
+        }
+        if (releaseNotesPrefs.getString("shown_version", null) == installedVersion) return@LaunchedEffect
+        releaseNotesCheckStarted = true
+        withContext(Dispatchers.IO) { AppUpdateManager.installedVersionReleaseNotes(context) }
+            .getOrNull()
+            ?.let { currentReleaseNotes = it }
     }
 
     LaunchedEffect(user?.id, networkAvailable) {
@@ -1098,6 +1131,17 @@ fun KarotterApp(
     }
 
     if (availableUpdate == null) {
+        currentReleaseNotes?.let { notes ->
+            ReleaseNotesDialog(notes) {
+                releaseNotesPrefs.edit()
+                    .putString("shown_version", AppUpdateManager.currentVersionName(context).removePrefix("v"))
+                    .apply()
+                currentReleaseNotes = null
+            }
+        }
+    }
+
+    if (availableUpdate == null && currentReleaseNotes == null) {
         creatorProfile?.let { profile ->
             CreatorFollowDialog(
                 profile = profile,
@@ -1196,6 +1240,25 @@ private fun MainShell(
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(currentUser?.id) {
+        val user = currentUser ?: return@LaunchedEffect
+        if (!api.hasNetworkConnection()) return@LaunchedEffect
+        when (val result = withContext(Dispatchers.IO) { api.accountSettings() }) {
+            is ApiResult.Success -> {
+                val remote = result.value
+                if (user.showReactions != remote.showReactions || user.levelEnabled != remote.levelEnabled) {
+                    onAccountChanged(
+                        user.copy(
+                            showReactions = remote.showReactions,
+                            levelEnabled = remote.levelEnabled
+                        )
+                    )
+                }
+            }
+            is ApiResult.Failure -> Unit
+        }
     }
 
     LaunchedEffect(appResumed, currentUser?.id) {
@@ -1662,10 +1725,7 @@ private fun MainShell(
                     }
                     PostMenuAction.PIN -> {
                         val postId = post.id ?: return@withContext ApiResult.Failure("投稿IDがありません")
-                        when (val unpinResult = api.pinPost(null)) {
-                            is ApiResult.Failure -> unpinResult
-                            is ApiResult.Success -> api.pinPost(postId)
-                        }
+                        api.updatePostPin(postId, true)
                     }
                 }
             }
@@ -1702,6 +1762,7 @@ private fun MainShell(
         }
     }
 
+    val bottomDockHazeState = remember { HazeState() }
     CompositionLocalProvider(
         LocalMentionHandler provides { username ->
         scope.launch {
@@ -1725,17 +1786,18 @@ private fun MainShell(
         LocalRekarotStates provides rekarotStates,
         LocalPostInteractionStates provides postInteractionStates,
         LocalLinkPreviewApi provides api,
+        LocalPinnedHeaderHazeState provides bottomDockHazeState,
+        LocalShowReactions provides (currentUser?.showReactions != false),
         LocalViewerIsPro provides (
             currentUser?.subscriptionPlan.equals("PRO", ignoreCase = true) &&
                 currentUser?.subscriptionStatus.equals("ACTIVE", ignoreCase = true)
             ),
         LocalPostMenuEnvironment provides PostMenuEnvironment(currentUser?.id, ::executePostMenuAction, ::openPostEditor)
     ) {
-    val bottomDockHazeState = remember { HazeState() }
     Box(Modifier.fillMaxSize().background(Paper).padding(top = safe.calculateTopPadding())) {
         AnimatedContent(
             targetState = section,
-            modifier = Modifier.fillMaxSize().hazeSource(state = bottomDockHazeState, zIndex = 0f),
+            modifier = Modifier.fillMaxSize(),
             transitionSpec = {
                 val forward = targetState.ordinal >= initialState.ordinal
                 (slideInHorizontally(tween(480, easing = FastOutSlowInEasing)) { if (forward) it / 4 else -it / 4 } + fadeIn(tween(280)))
@@ -1744,6 +1806,12 @@ private fun MainShell(
             label = "section"
         ) { current ->
             CompositionLocalProvider(LocalNavigationActive provides (current == section)) {
+                Box(
+                    Modifier.fillMaxSize().then(
+                        if (current == Section.HOME) Modifier
+                        else Modifier.hazeSource(state = bottomDockHazeState, zIndex = 0f)
+                    )
+                ) {
                 when (current) {
                 Section.HOME -> HomeScreen(
                     api, posts, stories, storiesLoading, storiesError, loading, homeLoadingMore, homeHasNext, error, currentUser,
@@ -1803,6 +1871,7 @@ private fun MainShell(
                     onUnreadCountChanged = { dmUnreadCount = it }
                 )
                 Section.PROFILE -> MyPageScreen(currentUser, api, themeKey, followsSystemTheme, onThemeChange, onLogout, onAccountChanged, onAddAccount, ::openNotifications, { pushOverlay(Overlay.PostDetail(it)) }, { openComposer(parent = it) }, { openComposer(quote = it) }, ::rekarot, ::like, ::bookmark, { openComposer() }, { openComposer(question = it) }, latestCreatedPost) { pushOverlay(Overlay.UserDetail(it.toProfilePost())) }
+                }
                 }
             }
         }
@@ -2628,6 +2697,50 @@ private fun AppUpdateDialog(
 }
 
 @Composable
+private fun ReleaseNotesDialog(notes: AppReleaseNotes, onDismiss: () -> Unit) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Column(
+            Modifier.fillMaxWidth().fillMaxHeight(.82f).padding(horizontal = 18.dp).navigationBarsPadding()
+                .clip(RoundedCornerShape(28.dp)).background(Paper)
+                .border(1.dp, Hairline, RoundedCornerShape(28.dp)).padding(22.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                KarohaAppLogo(52.dp)
+                Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f)) {
+                    KText("WHAT'S NEW", 9, Carrot, FontWeight.Black, letterSpacing = 1.8f)
+                    Spacer(Modifier.height(3.dp))
+                    KText(notes.title.ifBlank { notes.tagName }, 19, Ink, FontWeight.Black, maxLines = 2)
+                }
+            }
+            Spacer(Modifier.height(19.dp))
+            Column(
+                Modifier.fillMaxWidth().weight(1f).clip(RoundedCornerShape(18.dp))
+                    .background(Surface).border(1.dp, Hairline, RoundedCornerShape(18.dp))
+                    .verticalScroll(rememberScrollState()).padding(16.dp)
+            ) {
+                if (notes.notes.isBlank()) {
+                    KText("このバージョンの更新内容はありません。", 11, Muted, lineHeight = 18f)
+                } else {
+                    RichContentText(notes.notes, 11, Ink, lineHeight = 18f)
+                }
+            }
+            Spacer(Modifier.height(18.dp))
+            Box(
+                Modifier.fillMaxWidth().height(50.dp).clip(RoundedCornerShape(16.dp))
+                    .background(Strong).clickable { onDismiss() },
+                contentAlignment = Alignment.Center
+            ) {
+                KText("はじめる", 11, OnStrong, FontWeight.Black)
+            }
+        }
+    }
+}
+
+@Composable
 private fun CreatorFollowDialog(
     profile: ApiUser,
     following: Boolean,
@@ -2724,37 +2837,59 @@ private fun CreatorFollowDialog(
 
 @Composable
 private fun LaunchScreen(exiting: Boolean = false) {
-    val reveal = remember { Animatable(0f) }
-    LaunchedEffect(exiting) {
-        reveal.animateTo(
-            if (exiting) 0f else 1f,
-            tween(
-                durationMillis = if (exiting) 320 else 430,
-                easing = FastOutSlowInEasing
-            )
-        )
+    val entrance = remember { Animatable(0f) }
+    val departure = remember { Animatable(0f) }
+    LaunchedEffect(Unit) {
+        entrance.animateTo(1f, tween(durationMillis = 760, easing = FastOutSlowInEasing))
     }
-    Box(Modifier.fillMaxSize().background(Paper), contentAlignment = Alignment.Center) {
+    LaunchedEffect(exiting) {
+        if (exiting) {
+            departure.animateTo(1f, tween(durationMillis = 420, easing = FastOutSlowInEasing))
+        }
+    }
+
+    val logoProgress = (entrance.value / .68f).coerceIn(0f, 1f)
+    val copyProgress = ((entrance.value - .38f) / .62f).coerceIn(0f, 1f)
+    val exitProgress = departure.value
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Paper)
+            .alpha(1f - exitProgress),
+        contentAlignment = Alignment.Center
+    ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier
-                .offset(y = ((1f - reveal.value) * (-9f)).dp)
-                .scale(.86f + reveal.value * .14f)
-                .alpha(reveal.value)
+                .offset(y = ((1f - logoProgress) * 7f - exitProgress * 5f).dp)
+                .scale(1f + exitProgress * .018f)
         ) {
-            Canvas(Modifier.size(58.dp)) {
-                val width = 5.dp.toPx()
-                drawLine(Ink, Offset(size.width * .24f, size.height * .12f), Offset(size.width * .24f, size.height * .88f), width, StrokeCap.Round)
-                drawLine(Ink, Offset(size.width * .75f, size.height * .15f), Offset(size.width * .25f, size.height * .56f), width, StrokeCap.Round)
-                drawLine(Carrot, Offset(size.width * .42f, size.height * .43f), Offset(size.width * .78f, size.height * .88f), width, StrokeCap.Round)
-                drawCircle(Carrot, 3.5.dp.toPx(), Offset(size.width * .78f, size.height * .88f))
+            Box(
+                Modifier
+                    .scale(.92f + logoProgress * .08f)
+                    .alpha(logoProgress)
+            ) {
+                KarohaAppLogo(72.dp)
             }
-            Spacer(Modifier.height(22.dp))
-            KText("KAROHA", 13, Ink, FontWeight.Black, letterSpacing = 4.4f)
-            Spacer(Modifier.height(7.dp))
-            KText("FOR KAROTTER", 8, Muted, FontWeight.Bold, letterSpacing = 1.8f)
-            Spacer(Modifier.height(5.dp))
-            KText("BY NAMICODE", 8, Carrot, FontWeight.Black, letterSpacing = 1.8f)
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .offset(y = ((1f - copyProgress) * 5f).dp)
+                    .alpha(copyProgress)
+            ) {
+                Spacer(Modifier.height(24.dp))
+                KText("KAROHA", 15, Ink, FontWeight.Black, letterSpacing = 5.8f)
+                Spacer(Modifier.height(13.dp))
+                Box(
+                    Modifier
+                        .width((24f * copyProgress).dp)
+                        .height(1.dp)
+                        .background(Carrot.copy(alpha = .72f))
+                )
+                Spacer(Modifier.height(12.dp))
+                KText("NAMICODE", 8, Muted, FontWeight.Bold, letterSpacing = 2.4f)
+            }
         }
     }
 }
@@ -3106,6 +3241,8 @@ private fun HomeScreen(
     onBookmark: (Post, Boolean) -> Unit
 ) {
     val renderedPosts = remember(posts) { posts.distinctBy(::postStableKey) }
+    val homeListState = rememberLazyListState()
+    val filtersPinned = homeListState.firstVisibleItemIndex > 2
     var communityPickerOpen by remember { mutableStateOf(false) }
     var pendingCommunityRemoval by remember { mutableStateOf<ApiCommunity?>(null) }
     var removingCommunity by remember { mutableStateOf(false) }
@@ -3186,9 +3323,28 @@ private fun HomeScreen(
         }
     }
     val homeContentAlpha = (1f - abs(homeContentShift.value) / 120f).coerceIn(.68f, 1f)
+    val fallbackHomeHazeState = remember { HazeState() }
+    val homeHeaderHazeState = LocalPinnedHeaderHazeState.current ?: fallbackHomeHazeState
+    val homeFilters: @Composable () -> Unit = {
+        FilterStrip(
+            selectedMode,
+            onModeChange,
+            selectedRanking,
+            onRankingChange,
+            homeCommunities,
+            onAddCommunity = { communityPickerOpen = true },
+            onRemoveCommunity = {
+                communityRemovalError = null
+                pendingCommunityRemoval = it
+            }
+        )
+    }
+    Box(Modifier.fillMaxSize()) {
     LazyColumn(
+        state = homeListState,
         modifier = Modifier
             .fillMaxSize()
+            .hazeSource(state = homeHeaderHazeState, zIndex = 0f)
             .pointerInput(selectedMode, swipeModes) {
                 var horizontalDistance = 0f
                 detectHorizontalDragGestures(
@@ -3211,20 +3367,7 @@ private fun HomeScreen(
     ) {
         item { HomeHeader(currentUser, unreadCount, onNotifications) }
         item { Stories(stories, storiesLoading, storiesError, currentUser, onCreateStory, onStory) }
-        stickyHeader(key = "home-filters") {
-            FilterStrip(
-                selectedMode,
-                onModeChange,
-                selectedRanking,
-                onRankingChange,
-                homeCommunities,
-                onAddCommunity = { communityPickerOpen = true },
-                onRemoveCommunity = {
-                    communityRemovalError = null
-                    pendingCommunityRemoval = it
-                }
-            )
-        }
+        item(key = "home-filters") { PinnedGlassSurface(pinned = false) { homeFilters() } }
         if (error != null) item {
             Box(Modifier.offset(x = homeContentShift.value.dp).alpha(homeContentAlpha)) {
                 ErrorStrip(error, onRetry)
@@ -3257,6 +3400,14 @@ private fun HomeScreen(
                 }
             }
         }
+    }
+    if (filtersPinned) {
+        PinnedGlassSurface(
+            pinned = true,
+            explicitHazeState = homeHeaderHazeState,
+            modifier = Modifier.align(Alignment.TopCenter).zIndex(2f)
+        ) { homeFilters() }
+    }
     }
 }
 
@@ -3450,7 +3601,7 @@ private fun FilterStrip(
 ) {
     val options = listOf("みんな" to "latest", "フォロー中" to "following", "トレンド" to "trending") +
         homeCommunities.map { it.name to "community:${it.id}" }
-    Column(Modifier.fillMaxWidth().background(Paper).padding(horizontal = 22.dp, vertical = 15.dp)) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 15.dp)) {
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             item(key = "add-community-timeline") {
                 Box(
@@ -3767,7 +3918,7 @@ private fun PostCard(
                         PostMenuAction.MUTE -> "タイムラインに投稿を表示しない"
                         PostMenuAction.BLOCK -> "フォロー関係を解除して操作を制限"
                         PostMenuAction.DELETE -> "この投稿を完全に削除"
-                        PostMenuAction.PIN -> "現在の固定を解除して、この投稿を固定"
+                        PostMenuAction.PIN -> "プランの上限まで固定投稿に追加"
                     }
                     Row(
                         Modifier.fillMaxWidth().clip(RoundedCornerShape(15.dp))
@@ -3823,7 +3974,7 @@ private fun PostCard(
             PostMenuAction.MUTE -> "${post.name}さんの投稿をタイムラインに表示しないようにします。相手には通知されません。"
             PostMenuAction.BLOCK -> "${post.name}さんとのフォロー関係を解除し、互いの操作を制限します。"
             PostMenuAction.DELETE -> "削除した投稿は元に戻せません。"
-            PostMenuAction.PIN -> "現在固定している投稿を解除してから、この投稿をプロフィールに固定します。"
+            PostMenuAction.PIN -> "この投稿をプロフィールの固定投稿に追加します。固定できる件数はプランによって異なります。"
         }
         Dialog(onDismissRequest = { if (!menuActionBusy) pendingMenuAction = null }) {
             Column(
@@ -3992,7 +4143,7 @@ private fun PostCard(
                     Spacer(Modifier.height(12.dp))
                     PostLinkPreviewCard(url)
                 }
-                if (reactions.isNotEmpty() || reactionHandler != null) {
+                if (LocalShowReactions.current && (reactions.isNotEmpty() || reactionHandler != null)) {
                     Spacer(Modifier.height(10.dp))
                     ReactionStrip(
                         reactions = reactions,
@@ -4539,7 +4690,7 @@ private val ProReactionOptions = listOf(
     "pro:sorena" to "それな", "pro:sugoi" to "すごい", "pro:suki" to "すき",
     "pro:syogyomujo" to "諸行無常", "pro:syunkasyuutouasahiruban" to "春夏秋冬朝昼晩",
     "pro:takuan" to "たくあん", "pro:tasukaru" to "助かる", "pro:tasukete" to "たすけて",
-    "pro:tensai" to "天才！", "pro:thinkkaron1" to "疑問（かろん）", "pro:this" to "これは",
+    "pro:tensai" to "天才！", "pro:thinkkaron1" to "疑問（かろん）", "pro:koreha" to "これは",
     "pro:tigaimasu" to "違います", "pro:umai" to "うまい", "pro:uo-!!" to "うおー！！",
     "pro:urayamasii" to "羨ましい", "pro:wakaru" to "わかる", "pro:watashihakami" to "私は神",
     "pro:yamete" to "やめて", "pro:yasasii" to "やさしい", "pro:yoroshiku" to "よろしく",
@@ -4673,12 +4824,15 @@ private fun AccountMarks(officialMarks: List<String>, isBot: Boolean, isParody: 
 private fun ReactionVisual(value: String, imageSize: Dp, emojiSize: Int) {
     val proName = value.takeIf { it.startsWith("pro:", ignoreCase = true) }
         ?.substringAfter(':')
-        ?.removeSuffix(".png")
+        ?.replace(Regex("(?i)\\.png$"), "")
+        ?.let { if (it.equals("koreha", ignoreCase = true)) "this" else it }
         ?.takeIf { it.matches(Regex("[A-Za-z0-9_!-]{1,80}")) }
     var imageFailed by remember(value) { mutableStateOf(false) }
     if (proName != null && !imageFailed) {
         AsyncImage(
-            model = "https://karotter.com/reactions/pro/${Uri.encode(proName)}.png",
+            // KarotterのIDは通常 `pro:name` だが、`pro:desu.png` のように
+            // 拡張子を含むものもある。ファイル名の記号はそのまま維持する。
+            model = "https://karotter.com/reactions/pro/${Uri.encode(proName, "-_!")}.png",
             contentDescription = "PROリアクション $proName",
             modifier = Modifier.height(imageSize).widthIn(min = imageSize, max = imageSize * 3),
             contentScale = ContentScale.Fit,
@@ -6058,6 +6212,7 @@ private fun CommunityDetailScreen(
     var membershipNotice by remember(initial.id) { mutableStateOf(false) }
     var error by remember(initial.id) { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
+    val communityTabsPinned = listState.firstVisibleItemIndex >= 1
     val scope = rememberCoroutineScope()
     val isOwner = currentUser?.id != null && community.ownerId == currentUser.id
     suspend fun loadNext() {
@@ -6295,7 +6450,8 @@ private fun CommunityDetailScreen(
                 Box(Modifier.fillMaxWidth().height(1.dp).background(Hairline))
             }
             stickyHeader(key = "community-detail-tabs") {
-                Row(Modifier.fillMaxWidth().background(Paper)) {
+                PinnedGlassSurface(pinned = communityTabsPinned, blurEnabled = false) {
+                Row(Modifier.fillMaxWidth()) {
                     listOf(
                         "人気" to "trending",
                         "最新" to "latest",
@@ -6321,6 +6477,7 @@ private fun CommunityDetailScreen(
                     }
                 }
                 Box(Modifier.fillMaxWidth().height(1.dp).background(Hairline))
+            }
             }
             if (selectedTab == "media") {
                 val gallery = posts.flatMap { post ->
@@ -7234,6 +7391,7 @@ private fun SearchResultsScreen(
         0 -> if (postSort == "media") mediaListState else postListState
         else -> postListState
     }
+    val searchControlsPinned = listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 0
     val visibleMedia = remember(mediaPosts) {
         mediaPosts.distinctBy(::postStableKey).flatMap { post ->
             post.media.filter { media ->
@@ -7263,8 +7421,10 @@ private fun SearchResultsScreen(
                 ) { _, dragAmount -> horizontalDistance += dragAmount }
                 }
         ) {
+        PinnedGlassSurface(pinned = searchControlsPinned, blurEnabled = false) {
+        Column(Modifier.fillMaxWidth()) {
         Row(
-            Modifier.fillMaxWidth().background(Paper).padding(horizontal = 18.dp, vertical = 10.dp),
+            Modifier.fillMaxWidth().background(if (searchControlsPinned) Color.Transparent else Paper).padding(horizontal = 18.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
@@ -7303,7 +7463,7 @@ private fun SearchResultsScreen(
                 }
             }
         }
-        Row(Modifier.fillMaxWidth().background(Surface)) {
+        Row(Modifier.fillMaxWidth().background(if (searchControlsPinned) Color.Transparent else Surface)) {
             listOf("投稿", "ユーザー").forEachIndexed { index, label ->
                 val enabled = index == 0 || !initialPostsLoading
                 val indicatorWidth by animateDpAsState(
@@ -7350,6 +7510,8 @@ private fun SearchResultsScreen(
                     }
                 }
             }
+        }
+        }
         }
         LazyColumn(
             state = listState,
@@ -10256,7 +10418,7 @@ private fun InfiniteLoadEffect(state: LazyListState, itemCount: Int, hasNext: Bo
     }
 }
 
-@OptIn(coil.annotation.ExperimentalCoilApi::class)
+@OptIn(coil.annotation.ExperimentalCoilApi::class, ExperimentalFoundationApi::class)
 @Composable
 private fun MyPageScreen(user: ApiUser?, api: KarotterApi, themeKey: String, followsSystemTheme: Boolean, onThemeChange: (String) -> Unit, onLogout: () -> Unit, onAccountChanged: (ApiUser) -> Unit, onAddAccount: () -> Unit, onNotifications: () -> Unit, onPost: (Post) -> Unit, onReply: (Post) -> Unit, onQuote: (Post) -> Unit, onRekarot: (Post, Boolean) -> Unit, onLike: (Post, Boolean) -> Unit, onBookmark: (Post, Boolean) -> Unit, onCompose: () -> Unit, onAnswerQuestion: (ApiQuestion) -> Unit, latestCreatedPost: Post?, onUser: (ApiUser) -> Unit) {
     if (user == null) { LoadingPost(); return }
@@ -10272,6 +10434,12 @@ private fun MyPageScreen(user: ApiUser?, api: KarotterApi, themeKey: String, fol
     var accountError by remember { mutableStateOf<String?>(null) }
     val darkMode = themeKey.endsWith("-dark")
     val themeFamily = themeKey.removeSuffix("-dark")
+    LaunchedEffect(user.showReactions, user.levelEnabled) {
+        detailedProfileUser = detailedProfileUser.copy(
+            showReactions = user.showReactions,
+            levelEnabled = user.levelEnabled
+        )
+    }
     LaunchedEffect(page, user.id, user.username, profileReloadKey) {
         if (page != "root" && page != "profile" && page != "profileEdit") return@LaunchedEffect
         suspend fun refreshProfileCard() {
@@ -10423,6 +10591,38 @@ private fun MyPageScreen(user: ApiUser?, api: KarotterApi, themeKey: String, fol
             }
             return
         }
+        "privacySettings" -> {
+            MyPageTransition("privacySettings", true) {
+                AccountSettingsScreen(api, "privacy", { page = "root" }, { destination -> page = destination })
+            }
+            return
+        }
+        "contentSettings" -> {
+            MyPageTransition("contentSettings", true) {
+                AccountSettingsScreen(
+                    api = api,
+                    section = "content",
+                    onBack = { page = "root" },
+                    onNavigate = { destination -> page = destination },
+                    onSettingsChanged = { changed ->
+                        detailedProfileUser = detailedProfileUser.copy(
+                            showReactions = changed.showReactions,
+                            levelEnabled = changed.levelEnabled
+                        )
+                        onAccountChanged(detailedProfileUser)
+                    }
+                )
+            }
+            return
+        }
+        "blockedUsers", "mutedUsers" -> {
+            MyPageTransition(page, true) {
+                RestrictedUsersScreen(api, blocked = page == "blockedUsers", onBack = {
+                    page = if (page == "blockedUsers") "privacySettings" else "contentSettings"
+                })
+            }
+            return
+        }
         "appearance" -> {
             MyPageTransition("appearance", true) {
             Column(Modifier.fillMaxSize().background(Paper)) {
@@ -10431,7 +10631,40 @@ private fun MyPageScreen(user: ApiUser?, api: KarotterApi, themeKey: String, fol
                     item {
                         KText("3つの個性を、ライトとダークで。", 13, Muted, lineHeight = 20f)
                         Spacer(Modifier.height(16.dp))
-                        Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Surface).border(1.dp, Hairline, RoundedCornerShape(16.dp)).padding(4.dp)) {
+                        Row(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Surface)
+                                .border(1.dp, Hairline, RoundedCornerShape(16.dp))
+                                .pointerInput(followsSystemTheme, darkMode, themeFamily) {
+                                    var dragDistance = 0f
+                                    detectHorizontalDragGestures(
+                                        onDragStart = { dragDistance = 0f },
+                                        onDragCancel = { dragDistance = 0f },
+                                        onDragEnd = {
+                                            val current = when {
+                                                followsSystemTheme -> 0
+                                                !darkMode -> 1
+                                                else -> 2
+                                            }
+                                            val next = when {
+                                                dragDistance < -60f -> (current + 1).coerceAtMost(2)
+                                                dragDistance > 60f -> (current - 1).coerceAtLeast(0)
+                                                else -> current
+                                            }
+                                            if (next != current) {
+                                                onThemeChange(
+                                                    when (next) {
+                                                        0 -> "system:$themeFamily"
+                                                        2 -> "$themeFamily-dark"
+                                                        else -> themeFamily
+                                                    }
+                                                )
+                                            }
+                                            dragDistance = 0f
+                                        },
+                                        onHorizontalDrag = { _, amount -> dragDistance += amount }
+                                    )
+                                }.padding(4.dp)
+                        ) {
                             listOf(
                                 Triple("端末", "system", followsSystemTheme),
                                 Triple("ライト", "light", !followsSystemTheme && !darkMode),
@@ -10467,7 +10700,7 @@ private fun MyPageScreen(user: ApiUser?, api: KarotterApi, themeKey: String, fol
                         }
                         Spacer(Modifier.height(12.dp))
                     }
-                }
+            }
             }
             }
             return
@@ -10881,20 +11114,26 @@ private fun MyPageScreen(user: ApiUser?, api: KarotterApi, themeKey: String, fol
                 MyPageRow("予約投稿", "これから公開される投稿", "scheduled") { page = "scheduledPosts" }
                 MyPageDivider()
                 MyPageRow("質問箱", "届いた質問を確認", "question") { page = "questions" }
-                MyPageDivider()
-                MyPageRow("レベルランキング", "上位100人のレベルと経験値", "ranking") { page = "ranking" }
+                if (rootUser.levelEnabled) {
+                    MyPageDivider()
+                    MyPageRow("レベルランキング", "上位100人のレベルと経験値", "ranking") { page = "ranking" }
+                }
             }
         }
         item { MyPageSectionTitle("環境設定", "Karohaの表示とバックグラウンド動作") }
         item {
             MyPageGroupCard {
                 MyPageRow("外観テーマ", "${themeFamily.replaceFirstChar { c -> c.uppercase() }} · ${if (followsSystemTheme) "端末に合わせる" else if (darkMode) "ダーク" else "ライト"}", "◐") { page = "appearance" }
+                MyPageDivider()
+                MyPageRow("通知設定", "バックグラウンド通知とAndroidの設定", "bell") { page = "notificationSettings" }
+                MyPageDivider()
+                MyPageRow("プライバシー", "公開範囲・DM・質問の受信設定", "lock") { page = "privacySettings" }
+                MyPageDivider()
+                MyPageRow("コンテンツ表示", "タイムラインと表示フィルター", "content") { page = "contentSettings" }
                 if (rootUser.subscriptionPlan.equals("PRO", true) && rootUser.subscriptionStatus.equals("ACTIVE", true)) {
                     MyPageDivider()
                     MyPageRow("Pro設定", "プロフィールと投稿カードの装飾", "proSettings") { page = "proSettings" }
                 }
-                MyPageDivider()
-                MyPageRow("通知設定", "バックグラウンド通知とAndroidの設定", "bell") { page = "notificationSettings" }
                 MyPageDivider()
                 MyPageRow("ストレージとキャッシュ", cacheMessage ?: "一時保存された画像を管理", "trash") {
                     confirmCacheClear = true
@@ -11163,14 +11402,25 @@ private fun ProfileEditScreen(
                 }
                 Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp).offset(y = (-30).dp), verticalAlignment = Alignment.Bottom) {
                     Box(
-                        Modifier.size(78.dp).background(PaleCarrot, RoundedCornerShape(25.dp))
-                            .border(4.dp, Paper, RoundedCornerShape(27.dp))
-                            .clickable(enabled = !saving) { avatarPicker.launch(arrayOf("image/*")) },
+                        Modifier.size(78.dp).clip(RoundedCornerShape(27.dp)).background(Paper)
+                            .clickable(enabled = !saving) { avatarPicker.launch(arrayOf("image/*")) }
+                            .padding(5.dp),
                         contentAlignment = Alignment.Center
                     ) {
-                        val avatarModel: Any? = avatar?.uri ?: user.avatarUrl
-                        if (avatarModel != null) AsyncImage(avatarModel, "アイコン", Modifier.fillMaxSize().clip(RoundedCornerShape(23.dp)), contentScale = ContentScale.Crop)
-                        else KText(displayName.take(1), 25, Ink, FontWeight.Black)
+                        Box(
+                            Modifier.fillMaxSize().clip(RoundedCornerShape(22.dp)).background(PaleCarrot),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            val avatarModel: Any? = avatar?.uri ?: user.avatarUrl
+                            if (avatarModel != null) {
+                                AsyncImage(
+                                    avatarModel,
+                                    "アイコン",
+                                    Modifier.fillMaxSize(),
+                                    contentScale = ContentScale.Crop
+                                )
+                            } else KText(displayName.take(1), 25, Ink, FontWeight.Black)
+                        }
                     }
                     Spacer(Modifier.width(13.dp))
                     KText("画像をタップして変更", 10, Muted, FontWeight.Bold, modifier = Modifier.padding(bottom = 9.dp))
@@ -11327,6 +11577,323 @@ private fun ProfileEditField(
 }
 
 @Composable
+private fun AccountSettingsScreen(
+    api: KarotterApi,
+    section: String,
+    onBack: () -> Unit,
+    onNavigate: (String) -> Unit,
+    onSettingsChanged: (ApiAccountSettings) -> Unit = {}
+) {
+    val scope = rememberCoroutineScope()
+    var settings by remember { mutableStateOf<ApiAccountSettings?>(null) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var keywordInput by remember { mutableStateOf("") }
+
+    fun reload() {
+        loading = true
+        scope.launch {
+            when (val result = withContext(Dispatchers.IO) { api.accountSettings() }) {
+                is ApiResult.Success -> {
+                    settings = result.value
+                    error = null
+                }
+                is ApiResult.Failure -> error = result.message
+            }
+            loading = false
+        }
+    }
+
+    fun patch(key: String, value: Any?, updated: ApiAccountSettings) {
+        val previous = settings ?: return
+        settings = updated
+        onSettingsChanged(updated)
+        error = null
+        scope.launch {
+            when (val result = withContext(Dispatchers.IO) { api.updateAccountSettings(mapOf(key to value)) }) {
+                is ApiResult.Success -> Unit
+                is ApiResult.Failure -> {
+                    settings = previous
+                    onSettingsChanged(previous)
+                    error = result.message
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(section) { reload() }
+    Column(Modifier.fillMaxSize().background(Paper)) {
+        OverlayHeader(if (section == "privacy") "プライバシー" else "コンテンツ表示", onBack)
+        if (loading && settings == null) {
+            LoadingPost()
+            return@Column
+        }
+        val current = settings
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(
+                start = 18.dp,
+                top = 16.dp,
+                end = 18.dp,
+                bottom = WindowInsets.safeDrawing.asPaddingValues().calculateBottomPadding() + 104.dp
+            ),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            error?.let { item { ErrorText(it) } }
+            if (current == null) {
+                item {
+                    SettingsNavigationCard(error ?: "設定を取得できませんでした", "タップして再試行", IconType.REFRESH) { reload() }
+                }
+            } else if (section == "privacy") {
+                item {
+                    SettingsPanel {
+                        SettingsSectionTitle("公開と受信", "アカウントの公開範囲と受信条件")
+                        SettingsToggleRow("非公開アカウント", "承認したフォロワーだけに投稿を公開", current.isPrivate) {
+                            patch("isPrivate", it, current.copy(isPrivate = it))
+                        }
+                        SettingsToggleRow("いいねの公開", "プロフィールでいいねした投稿を公開", current.showLikedPosts) {
+                            patch("showLikedPosts", it, current.copy(showLikedPosts = it))
+                        }
+                        SettingsToggleRow("既読通知の送信", "DMを読んだことを相手へ知らせる", current.showReadReceipts) {
+                            patch("showReadReceipts", it, current.copy(showReadReceipts = it))
+                        }
+                        SettingsToggleRow("DMを受け取る", "ダイレクトメッセージの受信を許可", current.directMessagesEnabled) {
+                            patch("directMessagesEnabled", it, current.copy(directMessagesEnabled = it))
+                        }
+                        SettingsToggleRow("質問を受け取る", "質問箱への新しい質問を許可", current.questionsEnabled) {
+                            patch("questionsEnabled", it, current.copy(questionsEnabled = it))
+                        }
+                        SettingsToggleRow("ギフトを受け取る", "ほかのユーザーからのギフトを許可", current.giftsEnabled) {
+                            patch("giftsEnabled", it, current.copy(giftsEnabled = it))
+                        }
+                        SettingsToggleRow(
+                            "返信先で外せる人を最初から外す",
+                            "返信元の投稿者など必須の返信先は残します",
+                            current.defaultExcludeReplyTargets
+                        ) {
+                            patch("defaultExcludeReplyTargets", it, current.copy(defaultExcludeReplyTargets = it))
+                        }
+                    }
+                }
+                item {
+                    SettingsPanel {
+                        SettingsSectionTitle("オンラインステータス公開範囲", "オンライン状態を見られる相手")
+                        SettingsChoiceRow(
+                            listOf("全体公開" to "PUBLIC", "フォロワー" to "FOLLOWERS", "非公開" to "PRIVATE"),
+                            current.onlineStatusVisibility
+                        ) {
+                            patch("onlineStatusVisibility", it, current.copy(onlineStatusVisibility = it))
+                        }
+                        Spacer(Modifier.height(14.dp))
+                        SettingsSectionTitle("メッセージリクエスト", "リクエストを許可する相手")
+                        SettingsChoiceRow(
+                            listOf("全員" to "EVERYONE", "認証済み" to "VERIFIED_ONLY", "フォロワー" to "FOLLOWERS_ONLY", "なし" to "NONE"),
+                            current.dmRequestPolicy
+                        ) {
+                            patch("dmRequestPolicy", it, current.copy(dmRequestPolicy = it))
+                        }
+                    }
+                }
+                item {
+                    SettingsNavigationCard("ブロック中のアカウント", "ブロックしたアカウントの確認と解除", IconType.BLOCK) {
+                        onNavigate("blockedUsers")
+                    }
+                }
+            } else {
+                item {
+                    SettingsPanel {
+                        SettingsSectionTitle("プロフィールとリアクション", "表示する機能を選択")
+                        SettingsToggleRow("リアクションを表示", "オフにするとリアクション通知も停止", current.showReactions) {
+                            patch("showReactions", it, current.copy(showReactions = it))
+                        }
+                        SettingsToggleRow("レベル機能", "経験値の獲得とプロフィール・ランキング表示", current.levelEnabled) {
+                            patch("levelEnabled", it, current.copy(levelEnabled = it))
+                        }
+                    }
+                }
+                item {
+                    SettingsPanel {
+                        SettingsSectionTitle("タイムライン表示", "表示する投稿とアカウント")
+                        SettingsToggleRow("管理者による非表示投稿を表示", "管理者が非表示にした投稿も表示", current.showHiddenPosts) {
+                            patch("showHiddenPosts", it, current.copy(showHiddenPosts = it))
+                        }
+                        SettingsToggleRow("パロディアカウントを表示", "パロディラベルのアカウントを表示", current.showParodyAccounts) {
+                            patch("showParodyAccounts", it, current.copy(showParodyAccounts = it))
+                        }
+                        SettingsToggleRow("BOTアカウントを表示", "BOTラベルのアカウントを表示", current.showBotAccounts) {
+                            patch("showBotAccounts", it, current.copy(showBotAccounts = it))
+                        }
+                        SettingsToggleRow("R18・未成年向け非表示投稿を表示", "年齢条件を満たす場合のみ適用", current.showR18Content) {
+                            patch("showR18Content", it, current.copy(showR18Content = it))
+                        }
+                        SettingsToggleRow("TLに返信を表示", "ホームタイムラインへ返信を表示", current.showRepliesInTimeline) {
+                            patch("showRepliesInTimeline", it, current.copy(showRepliesInTimeline = it))
+                        }
+                        SettingsToggleRow("TLにリカロートを表示", "フォロー中ユーザーのリカロートを表示", current.showRekarotsInTimeline) {
+                            patch("showRekarotsInTimeline", it, current.copy(showRekarotsInTimeline = it))
+                        }
+                        SettingsToggleRow("未フォローの人がしたRKを非表示", "自分またはフォロー中のユーザーによるRKだけ表示", current.hideUnfollowedRekarotsInTimeline) {
+                            patch("hideUnfollowedRekarotsInTimeline", it, current.copy(hideUnfollowedRekarotsInTimeline = it))
+                        }
+                    }
+                }
+                item {
+                    SettingsPanel {
+                        SettingsSectionTitle("公開ラベルと年齢制限", "自分のプロフィールに適用")
+                        SettingsToggleRow("パロディアカウントとして表示", "プロフィールへパロディラベルを表示", current.isParodyAccount) {
+                            patch("isParodyAccount", it, current.copy(isParodyAccount = it))
+                        }
+                        SettingsToggleRow("BOTアカウントとして表示", "プロフィールへBOTラベルを表示", current.isBotAccount) {
+                            patch("isBotAccount", it, current.copy(isBotAccount = it))
+                        }
+                        SettingsToggleRow("未成年にプロフィールを表示しない", "自分の投稿とプロフィールを未成年から隠す", current.hideProfileFromMinors) {
+                            patch("hideProfileFromMinors", it, current.copy(hideProfileFromMinors = it))
+                        }
+                        KText("プロフィールを見られる最低年齢", 9, Muted, FontWeight.Bold)
+                        SettingsNullableNumberRow(listOf(6, 13, 16, 18, 20), current.profileMinimumAge) {
+                            patch("profileMinimumAge", it, current.copy(profileMinimumAge = it))
+                        }
+                        Spacer(Modifier.height(10.dp))
+                        KText("プロフィールを見られる最高年齢", 9, Muted, FontWeight.Bold)
+                        SettingsNullableNumberRow(listOf(17, 19, 29, 39, 59), current.profileMaximumAge) {
+                            patch("profileMaximumAge", it, current.copy(profileMaximumAge = it))
+                        }
+                    }
+                }
+                item {
+                    SettingsPanel {
+                        SettingsSectionTitle("ミュート中のキーワード", "タイムラインに表示したくない言葉")
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            BasicTextField(
+                                value = keywordInput,
+                                onValueChange = { keywordInput = it.take(80) },
+                                singleLine = true,
+                                textStyle = TextStyle(Ink, 12.sp, FontWeight.Medium),
+                                cursorBrush = androidx.compose.ui.graphics.SolidColor(Carrot),
+                                modifier = Modifier.weight(1f).height(42.dp).background(Paper, RoundedCornerShape(12.dp))
+                                    .border(1.dp, Hairline, RoundedCornerShape(12.dp)).padding(horizontal = 11.dp),
+                                decorationBox = { inner ->
+                                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                                        if (keywordInput.isBlank()) KText("例：ネタバレ", 10, Muted)
+                                        inner()
+                                    }
+                                }
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Box(
+                                Modifier.clip(RoundedCornerShape(11.dp)).background(Carrot)
+                                    .clickable(enabled = keywordInput.isNotBlank()) {
+                                        val next = (current.mutedKeywords + keywordInput.trim()).distinct()
+                                        keywordInput = ""
+                                        patch("mutedKeywords", next, current.copy(mutedKeywords = next))
+                                    }.padding(horizontal = 13.dp, vertical = 11.dp)
+                            ) { KText("追加", 9, Color.White, FontWeight.Black) }
+                        }
+                        current.mutedKeywords.forEach { keyword ->
+                            Row(
+                                Modifier.fillMaxWidth().clickable {
+                                    val next = current.mutedKeywords.filterNot { it == keyword }
+                                    patch("mutedKeywords", next, current.copy(mutedKeywords = next))
+                                }.padding(vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                KText(keyword, 10, Ink, FontWeight.Bold, modifier = Modifier.weight(1f))
+                                CustomIcon(IconType.CLOSE, Muted, 14.dp)
+                            }
+                        }
+                    }
+                }
+                item {
+                    SettingsNavigationCard("ミュート中のアカウント", "ミュートしたアカウントの確認と解除", IconType.VOLUME_OFF) {
+                        onNavigate("mutedUsers")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsNavigationCard(title: String, description: String, icon: IconType, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Surface)
+            .border(1.dp, Hairline, RoundedCornerShape(18.dp)).clickable { onClick() }.padding(14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(Modifier.size(40.dp).background(Paper, RoundedCornerShape(13.dp)), contentAlignment = Alignment.Center) {
+            CustomIcon(icon, Ink, 18.dp)
+        }
+        Spacer(Modifier.width(11.dp))
+        Column(Modifier.weight(1f)) {
+            KText(title, 11, Ink, FontWeight.Black)
+            KText(description, 9, Muted)
+        }
+        CustomIcon(IconType.FORWARD, Muted, 15.dp)
+    }
+}
+
+@Composable
+private fun RestrictedUsersScreen(api: KarotterApi, blocked: Boolean, onBack: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    var users by remember { mutableStateOf<List<ApiUser>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    fun load() {
+        loading = true
+        scope.launch {
+            val result = withContext(Dispatchers.IO) { if (blocked) api.blockedUsers() else api.mutedUsers() }
+            when (result) {
+                is ApiResult.Success -> { users = result.value; error = null }
+                is ApiResult.Failure -> error = result.message
+            }
+            loading = false
+        }
+    }
+    LaunchedEffect(blocked) { load() }
+    Column(Modifier.fillMaxSize().background(Paper)) {
+        OverlayHeader(if (blocked) "ブロック中のアカウント" else "ミュート中のアカウント", onBack)
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+            if (loading) items(3) { LoadingPost() }
+            error?.let { item { ErrorText(it) } }
+            if (!loading && users.isEmpty() && error == null) item { KText("該当するアカウントはありません", 11, Muted) }
+            items(users, key = { it.id }) { user ->
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(17.dp)).background(Surface)
+                        .border(1.dp, Hairline, RoundedCornerShape(17.dp)).padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        Modifier.size(42.dp).clip(RoundedCornerShape(14.dp)).background(avatarColor(user.id)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (!user.avatarUrl.isNullOrBlank()) {
+                            AsyncImage(user.avatarUrl, user.displayName, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                        } else KText(user.displayName.take(1), 14, Ink, FontWeight.Black)
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f)) {
+                        KText(user.displayName, 11, Ink, FontWeight.Black, maxLines = 1)
+                        KText("@${user.username}", 9, Muted, maxLines = 1)
+                    }
+                    Box(
+                        Modifier.clip(RoundedCornerShape(11.dp)).border(1.dp, Hairline, RoundedCornerShape(11.dp))
+                            .clickable {
+                                scope.launch {
+                                    val result = withContext(Dispatchers.IO) {
+                                        if (blocked) api.block(user.id, false) else api.mute(user.id, false)
+                                    }
+                                    if (result is ApiResult.Success) users = users.filterNot { it.id == user.id }
+                                    else if (result is ApiResult.Failure) error = result.message
+                                }
+                            }.padding(horizontal = 11.dp, vertical = 8.dp)
+                    ) { KText("解除", 9, Color(0xFFD64045), FontWeight.Black) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun MyPageTransition(pageKey: String, forward: Boolean, content: @Composable () -> Unit) {
     var visible by remember(pageKey) { mutableStateOf(false) }
     LaunchedEffect(pageKey) { visible = true }
@@ -11384,6 +11951,8 @@ private fun MyPageRow(title: String, subtitle: String, symbol: String, danger: B
                 "bookmark" -> IconType.BOOKMARK
                 "scheduled" -> IconType.CALENDAR
                 "question" -> IconType.QUESTION
+                "lock" -> IconType.LOCK
+                "content" -> IconType.CONTROLS
                 "◐" -> IconType.THEME
                 "§" -> IconType.LICENSE
                 "K" -> IconType.INFO
@@ -12917,6 +13486,7 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
     var profileShareOpen by remember(user.id) { mutableStateOf(false) }
     var visibleFollowers by remember(user.id) { mutableIntStateOf(user.followersCount) }
     val listState = pageState.listState
+    val profileTabsPinned = listState.firstVisibleItemIndex >= 1
     val profileScope = rememberCoroutineScope()
     val profileActionSize = 36.dp
     suspend fun loadPage() {
@@ -13253,7 +13823,10 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
                         userPosts = userPosts.filterNot { it.id == affectedPost.id }
                         pinnedProfilePosts = pinnedProfilePosts.filterNot { it.id == affectedPost.id }
                     }
-                    PostMenuAction.PIN -> pinnedProfilePosts = listOf(affectedPost)
+                    PostMenuAction.PIN -> pinnedProfilePosts =
+                        (listOf(affectedPost) + pinnedProfilePosts)
+                            .distinctBy { it.id }
+                            .take(user.pinnedPostLimit.coerceAtLeast(1))
                     else -> Unit
                 }
                 onProfileReload?.invoke()
@@ -13532,33 +14105,35 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
             }
         }
         stickyHeader(key = "profile-tabs") {
-            Row(Modifier.fillMaxWidth().background(Surface)) {
-                profileTabs.forEach { (label, kind) ->
-                    val tabIcon = when (kind) {
-                        "posts" -> IconType.BOARD
-                        "replies" -> IconType.REPLY
-                        "media" -> IconType.IMAGE
-                        "likes" -> IconType.HEART
-                        else -> IconType.BOARD
-                    }
-                    val indicatorWidth by animateDpAsState(
-                        if (selectedKind == kind) 34.dp else 0.dp,
-                        tween(260, easing = FastOutSlowInEasing),
-                        label = "profileTabIndicator"
-                    )
-                    Column(Modifier.weight(1f).clickable { selectedKind = kind }.padding(top = 12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                        val contentColor = if (selectedKind == kind) Ink else Muted
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                            CustomIcon(tabIcon, contentColor, 14.dp, selectedKind == kind)
-                            KText(label, 11, contentColor, FontWeight.Bold, maxLines = 1)
+            PinnedGlassSurface(pinned = profileTabsPinned, baseColor = Surface, blurEnabled = false) {
+                Row(Modifier.fillMaxWidth()) {
+                    profileTabs.forEach { (label, kind) ->
+                        val tabIcon = when (kind) {
+                            "posts" -> IconType.BOARD
+                            "replies" -> IconType.REPLY
+                            "media" -> IconType.IMAGE
+                            "likes" -> IconType.HEART
+                            else -> IconType.BOARD
                         }
-                        Spacer(Modifier.height(10.dp))
-                        Box(Modifier.width(indicatorWidth).height(3.dp).background(if (selectedKind == kind) Carrot else Color.Transparent, RoundedCornerShape(2.dp)))
+                        val indicatorWidth by animateDpAsState(
+                            if (selectedKind == kind) 34.dp else 0.dp,
+                            tween(260, easing = FastOutSlowInEasing),
+                            label = "profileTabIndicator"
+                        )
+                        Column(Modifier.weight(1f).clickable { selectedKind = kind }.padding(top = 12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            val contentColor = if (selectedKind == kind) Ink else Muted
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                CustomIcon(tabIcon, contentColor, 14.dp, selectedKind == kind)
+                                KText(label, 11, contentColor, FontWeight.Bold, maxLines = 1)
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            Box(Modifier.width(indicatorWidth).height(3.dp).background(if (selectedKind == kind) Carrot else Color.Transparent, RoundedCornerShape(2.dp)))
+                        }
                     }
                 }
+                Box(Modifier.fillMaxWidth().height(1.dp).background(Hairline))
+                }
             }
-            Box(Modifier.fillMaxWidth().height(1.dp).background(Hairline))
-        }
         if (profileContentLocked) {
             item(key = "profile-restricted-notice-$selectedKind") {
                 val restrictionColor = when {
@@ -14006,6 +14581,58 @@ private fun EditorialHeader(kicker: String, title: String, subtitle: String) {
 @Composable
 private fun bottomDockContentInset(): Dp =
     WindowInsets.safeDrawing.asPaddingValues().calculateBottomPadding().coerceAtLeast(10.dp) + 55.dp
+
+@Composable
+private fun PinnedGlassSurface(
+    pinned: Boolean,
+    baseColor: Color = Paper,
+    explicitHazeState: HazeState? = null,
+    blurEnabled: Boolean = true,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit
+) {
+    val hazeState = explicitHazeState ?: LocalPinnedHeaderHazeState.current
+    val effectivePinned = pinned && blurEnabled
+    val glassAmount by animateFloatAsState(
+        targetValue = if (effectivePinned) 1f else 0f,
+        animationSpec = tween(220, easing = FastOutSlowInEasing),
+        label = "pinnedGlassAmount"
+    )
+    val glassOpacity = if (Paper.luminance() > .5f) .62f else .68f
+    val effectModifier = if (effectivePinned && hazeState != null) {
+        Modifier
+            .hazeEffect(state = hazeState) {
+                backgroundColor = Paper
+                blurRadius = 28.dp
+                noiseFactor = .08f
+            }
+    } else Modifier
+    Box(modifier) {
+        Box(
+            Modifier.matchParentSize()
+                .then(effectModifier)
+                .background(
+                    Brush.verticalGradient(
+                        listOf(
+                            baseColor.copy(alpha = 1f - glassAmount * (1f - glassOpacity + .12f)),
+                            baseColor.copy(alpha = 1f - glassAmount * (1f - glassOpacity))
+                        )
+                    )
+                )
+                .drawBehind {
+                    if (glassAmount > 0f) {
+                        drawLine(
+                            Color.White.copy(alpha = glassAmount * if (Paper.luminance() > .5f) .54f else .11f),
+                            Offset.Zero,
+                            Offset(size.width, 0f),
+                            1.dp.toPx()
+                        )
+                    }
+                }
+        )
+        Column(Modifier.fillMaxWidth()) { content() }
+    }
+}
 
 @Composable
 private fun BottomDock(
@@ -14538,26 +15165,46 @@ private fun Composer(
             hashtagColor = Carrot
         )
     }
-    var text by remember(question?.id) {
-        mutableStateOf(
-            question?.let { item ->
+    var editorValue by remember(question?.id) {
+        val initialText = question?.let { item ->
                 val mention = item.sender?.username?.let { "@$it " }.orEmpty()
                 "${mention}\n\nQ. ${item.content}\nA. "
             }.orEmpty()
-        )
+        mutableStateOf(TextFieldValue(initialText, selection = TextRange(initialText.length)))
     }
+    val text = editorValue.text
     var selectedMedia by remember { mutableStateOf<List<ComposerMedia>>(emptyList()) }
     var pollEnabled by remember { mutableStateOf(false) }
     var pollOptions by remember { mutableStateOf(listOf("", "")) }
     var pollDurationHours by remember { mutableIntStateOf(24) }
     var settings by remember(community?.id) { mutableStateOf(ComposerSettings(communityId = community?.id)) }
     var settingsOpen by remember { mutableStateOf(false) }
+    var previewOpen by remember { mutableStateOf(false) }
+    var markdownToolsOpen by remember { mutableStateOf(false) }
     var circles by remember { mutableStateOf<List<ApiCircle>>(emptyList()) }
     var communities by remember { mutableStateOf<List<ApiCommunity>>(emptyList()) }
     var sending by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var confirmClose by remember { mutableStateOf(false) }
     val backgroundInteractionSource = remember { MutableInteractionSource() }
+    val postCharacterLimit = currentUser?.postCharacterLimit?.coerceAtLeast(1) ?: 200
+
+    fun insertMarkdown(prefix: String, suffix: String = "", placeholder: String = "") {
+        val start = editorValue.selection.min.coerceIn(0, editorValue.text.length)
+        val end = editorValue.selection.max.coerceIn(start, editorValue.text.length)
+        val selected = editorValue.text.substring(start, end)
+        val body = selected.ifEmpty { placeholder }
+        val replacement = prefix + body + suffix
+        val updated = editorValue.text.replaceRange(start, end, replacement).take(postCharacterLimit)
+        val contentStart = (start + prefix.length).coerceAtMost(updated.length)
+        val contentEnd = (contentStart + body.length).coerceAtMost(updated.length)
+        editorValue = TextFieldValue(
+            text = updated,
+            selection = if (selected.isEmpty() && placeholder.isNotEmpty()) TextRange(contentStart, contentEnd)
+            else TextRange((start + replacement.length).coerceAtMost(updated.length))
+        )
+        error = null
+    }
     val mediaPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isEmpty()) return@rememberLauncherForActivityResult
         val picked = uris.map { uri ->
@@ -14570,7 +15217,10 @@ private fun Composer(
         val combined = (selectedMedia + picked).distinctBy { it.uri }
         val hasVideo = combined.any { it.mimeType.startsWith("video/") }
         val hasImage = combined.any { it.mimeType.startsWith("image/") }
+        val hasAudio = combined.any { it.mimeType.startsWith("audio/") }
         when {
+            hasAudio && (hasVideo || hasImage) -> error = "音声は画像・動画と同じ投稿に添付できません"
+            hasAudio && combined.size > 1 -> error = "音声は1件まで添付できます"
             hasVideo && hasImage -> error = "画像と動画は同じ投稿に添付できません"
             hasVideo && combined.size > 1 -> error = "動画は1件まで添付できます"
             !hasVideo && combined.size > 4 -> error = "画像は4件まで添付できます"
@@ -14580,7 +15230,23 @@ private fun Composer(
             }
         }
     }
-    val postCharacterLimit = currentUser?.postCharacterLimit?.coerceAtLeast(1) ?: 200
+    val audioPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val mime = context.contentResolver.getType(uri).orEmpty().ifBlank { "audio/*" }
+        val name = context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        } ?: "audio-${System.currentTimeMillis()}"
+        when {
+            selectedMedia.any { !it.mimeType.startsWith("audio/") } ->
+                error = "音声は画像・動画と同じ投稿に添付できません"
+            selectedMedia.any { it.mimeType.startsWith("audio/") } ->
+                error = "音声は1件まで添付できます"
+            else -> {
+                selectedMedia = listOf(ComposerMedia(uri, name, mime))
+                error = null
+            }
+        }
+    }
     val remaining = postCharacterLimit - text.length
     val validPollOptions = pollOptions.map(String::trim).filter(String::isNotBlank)
     val pollValid = !pollEnabled || validPollOptions.size >= 2
@@ -14596,14 +15262,28 @@ private fun Composer(
     }
     if (settingsOpen) {
         ComposerSettingsDialog(
+            api = api,
             initial = settings,
             circles = circles,
             communities = communities,
             onDismiss = { settingsOpen = false },
+            onCircleCreated = { created ->
+                circles = (circles + created).distinctBy { it.id }
+            },
             onSave = {
                 settings = it
                 settingsOpen = false
             }
+        )
+    }
+    if (previewOpen) {
+        ComposerPreviewDialog(
+            text = text,
+            currentUser = currentUser,
+            media = selectedMedia,
+            pollOptions = if (pollEnabled) validPollOptions else emptyList(),
+            quote = quote,
+            onDismiss = { previewOpen = false }
         )
     }
     BackHandler {
@@ -14707,6 +15387,15 @@ private fun Composer(
                     )
                 }
                 Box(
+                    Modifier.size(40.dp).clip(RoundedCornerShape(14.dp))
+                        .border(1.dp, Hairline, RoundedCornerShape(14.dp))
+                        .clickable(enabled = hasPostBody && !sending) { previewOpen = true },
+                    contentAlignment = Alignment.Center
+                ) {
+                    CustomIcon(IconType.EYE, if (hasPostBody) Ink else Muted, 18.dp)
+                }
+                Spacer(Modifier.width(8.dp))
+                Box(
                     Modifier.clip(RoundedCornerShape(15.dp))
                         .background(if (canSubmit) Carrot else Hairline)
                         .clickable(enabled = canSubmit) {
@@ -14781,8 +15470,12 @@ private fun Composer(
                     KText(currentUser?.displayName?.ifBlank { currentUser.username } ?: "Karoha", 11, Ink, FontWeight.Black)
                     Spacer(Modifier.height(8.dp))
                     BasicTextField(
-                        value = text,
-                        onValueChange = { text = it.take(postCharacterLimit); error = null },
+                        value = editorValue,
+                        onValueChange = {
+                            editorValue = if (it.text.length <= postCharacterLimit) it
+                            else it.copy(text = it.text.take(postCharacterLimit), selection = TextRange(postCharacterLimit))
+                            error = null
+                        },
                         textStyle = TextStyle(Ink, 19.sp, FontWeight.Medium, lineHeight = 29.sp),
                         visualTransformation = syntaxHighlight,
                         cursorBrush = androidx.compose.ui.graphics.SolidColor(Carrot),
@@ -14820,8 +15513,18 @@ private fun Composer(
                                             verticalArrangement = Arrangement.Center,
                                             horizontalAlignment = Alignment.CenterHorizontally
                                         ) {
-                                            KText("▶", 19, OnStrong, FontWeight.Black)
+                                            CustomIcon(
+                                                if (item.mimeType.startsWith("audio/")) IconType.VOLUME_ON else IconType.EYE,
+                                                OnStrong,
+                                                19.dp
+                                            )
                                             Spacer(Modifier.height(5.dp))
+                                            KText(
+                                                if (item.mimeType.startsWith("audio/")) "音声" else "動画",
+                                                8,
+                                                OnStrong,
+                                                FontWeight.Black
+                                            )
                                             KText(item.name, 8, OnStrong.copy(.72f), maxLines = 2)
                                         }
                                     }
@@ -14894,7 +15597,10 @@ private fun Composer(
                     )
                 }
                 Spacer(Modifier.height(11.dp))
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Row(
                         Modifier.clip(RoundedCornerShape(12.dp)).background(Paper)
                             .border(1.dp, Hairline, RoundedCornerShape(12.dp))
@@ -14906,6 +15612,18 @@ private fun Composer(
                         CustomIcon(IconType.IMAGE, Ink, 15.dp)
                         Spacer(Modifier.width(6.dp))
                         KText("画像・動画", 9, Ink, FontWeight.Bold)
+                    }
+                    Spacer(Modifier.width(7.dp))
+                    Row(
+                        Modifier.clip(RoundedCornerShape(12.dp)).background(Paper)
+                            .border(1.dp, Hairline, RoundedCornerShape(12.dp))
+                            .clickable(enabled = !sending) { audioPicker.launch(arrayOf("audio/*")) }
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        CustomIcon(IconType.VOLUME_ON, Ink, 14.dp)
+                        Spacer(Modifier.width(6.dp))
+                        KText("音声", 9, Ink, FontWeight.Bold)
                     }
                     Spacer(Modifier.width(7.dp))
                     Row(
@@ -14933,8 +15651,192 @@ private fun Composer(
                         Spacer(Modifier.width(6.dp))
                         KText("詳細", 9, Ink, FontWeight.Bold)
                     }
-                    Spacer(Modifier.weight(1f))
-                    KText("あと ${remaining}文字", 10, if (remaining <= 20) Carrot else Muted, FontWeight.Black)
+                    Spacer(Modifier.width(7.dp))
+                    Row(
+                        Modifier.clip(RoundedCornerShape(12.dp))
+                            .background(if (markdownToolsOpen) PaleCarrot else Paper)
+                            .border(1.dp, if (markdownToolsOpen) Carrot else Hairline, RoundedCornerShape(12.dp))
+                            .clickable(enabled = !sending) { markdownToolsOpen = !markdownToolsOpen }
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        KText("MD", 9, if (markdownToolsOpen) Carrot else Ink, FontWeight.Black)
+                        Spacer(Modifier.width(5.dp))
+                        CustomIcon(
+                            if (markdownToolsOpen) IconType.CHEVRON_UP else IconType.CHEVRON_DOWN,
+                            if (markdownToolsOpen) Carrot else Ink,
+                            12.dp
+                        )
+                    }
+                }
+                AnimatedVisibility(visible = markdownToolsOpen) {
+                    Column {
+                        Spacer(Modifier.height(11.dp))
+                        MarkdownAssistBar(onInsert = ::insertMarkdown)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MarkdownAssistBar(onInsert: (String, String, String) -> Unit) {
+    val tools = listOf(
+        Triple("B", "**", "太字") to "**",
+        Triple("I", "*", "斜体") to "*",
+        Triple("S", "~~", "取消線") to "~~",
+        Triple("</>", "`", "コード") to "`",
+        Triple("H", "## ", "見出し") to "",
+        Triple(">", "> ", "引用") to "",
+        Triple("-#", "-# ", "小さい文字") to "",
+        Triple("||", "||", "スポイラー") to "||",
+        Triple("LINK", "[", "リンク名") to "](https://)"
+    )
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            KText("マークダウン", 9, Muted, FontWeight.Black)
+            Spacer(Modifier.width(7.dp))
+            KText("文字を選択して装飾", 8, Muted.copy(alpha = .75f))
+        }
+        Spacer(Modifier.height(7.dp))
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            items(tools) { entry ->
+                val (tool, suffix) = entry
+                Box(
+                    Modifier.height(32.dp).clip(RoundedCornerShape(10.dp)).background(Paper)
+                        .border(1.dp, Hairline, RoundedCornerShape(10.dp))
+                        .clickable { onInsert(tool.second, suffix, tool.third) }
+                        .padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    KText(
+                        tool.first,
+                        10,
+                        Ink,
+                        when (tool.first) {
+                            "B" -> FontWeight.Black
+                            "I" -> FontWeight.Medium
+                            else -> FontWeight.Bold
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ComposerPreviewDialog(
+    text: String,
+    currentUser: ApiUser?,
+    media: List<ComposerMedia>,
+    pollOptions: List<String>,
+    quote: Post?,
+    onDismiss: () -> Unit
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
+    ) {
+        Column(
+            Modifier.fillMaxSize().background(Paper).statusBarsPadding().navigationBarsPadding()
+        ) {
+            Row(
+                Modifier.fillMaxWidth().background(Surface)
+                    .drawBehind { drawLine(Hairline, Offset(0f, size.height), Offset(size.width, size.height), 1.dp.toPx()) }
+                    .padding(horizontal = 18.dp, vertical = 13.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    Modifier.size(38.dp).border(1.dp, Hairline, CircleShape).clickable { onDismiss() },
+                    contentAlignment = Alignment.Center
+                ) { CustomIcon(IconType.BACK, Ink, 18.dp) }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    KText("投稿プレビュー", 16, Ink, FontWeight.Black)
+                    KText("実際の投稿に近い表示", 8, Muted, FontWeight.Bold, letterSpacing = 1.2f)
+                }
+                Box(
+                    Modifier.clip(RoundedCornerShape(13.dp)).background(Strong)
+                        .clickable { onDismiss() }.padding(horizontal = 15.dp, vertical = 9.dp)
+                ) { KText("編集に戻る", 10, OnStrong, FontWeight.Black) }
+            }
+            Column(
+                Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        Modifier.size(46.dp).clip(RoundedCornerShape(16.dp)).background(PaleCarrot),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (!currentUser?.avatarUrl.isNullOrBlank()) {
+                            AsyncImage(currentUser?.avatarUrl, currentUser?.displayName, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                        } else {
+                            KText(currentUser?.displayName?.take(1) ?: "K", 16, Ink, FontWeight.Black)
+                        }
+                    }
+                    Spacer(Modifier.width(11.dp))
+                    Column(Modifier.weight(1f)) {
+                        KText(currentUser?.let { it.displayName.ifBlank { it.username } } ?: "Karoha", 13, Ink, FontWeight.Black)
+                        KText("@${currentUser?.username.orEmpty()}", 10, Muted, FontWeight.Medium)
+                    }
+                    KText("プレビュー", 9, Muted, FontWeight.Bold)
+                }
+                if (text.isNotBlank()) {
+                    Spacer(Modifier.height(14.dp))
+                    RichContentText(text = text, size = 15, color = Ink, lineHeight = 22f, modifier = Modifier.fillMaxWidth())
+                }
+                quote?.let { quoted ->
+                    Spacer(Modifier.height(12.dp))
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(15.dp)).border(1.dp, Hairline, RoundedCornerShape(15.dp)).padding(12.dp)
+                    ) {
+                        KText("${quoted.name}  ${quoted.handle}", 10, Ink, FontWeight.Black)
+                        Spacer(Modifier.height(5.dp))
+                        RichContentText(quoted.text, 11, Ink, modifier = Modifier.fillMaxWidth(), maxLines = 4)
+                    }
+                }
+                if (media.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(media, key = { it.uri.toString() }) { item ->
+                            Box(
+                                Modifier.size(142.dp).clip(RoundedCornerShape(16.dp)).background(Strong),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (item.mimeType.startsWith("image/")) {
+                                    AsyncImage(item.uri, item.name, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                                    if (item.spoiler) {
+                                        Box(Modifier.fillMaxSize().background(Strong.copy(alpha = .88f)), contentAlignment = Alignment.Center) {
+                                            KText("センシティブなメディア", 9, OnStrong, FontWeight.Black, textAlign = TextAlign.Center)
+                                        }
+                                    }
+                                } else {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        CustomIcon(
+                                            if (item.mimeType.startsWith("audio/")) IconType.VOLUME_ON else IconType.EYE,
+                                            OnStrong,
+                                            22.dp
+                                        )
+                                        Spacer(Modifier.height(6.dp))
+                                        KText(if (item.mimeType.startsWith("audio/")) "音声" else "動画", 10, OnStrong, FontWeight.Black)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (pollOptions.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                        pollOptions.forEach { option ->
+                            Box(
+                                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).border(1.dp, Hairline, RoundedCornerShape(12.dp))
+                                    .padding(horizontal = 13.dp, vertical = 10.dp)
+                            ) { KText(option, 11, Ink, FontWeight.Bold) }
+                        }
+                    }
                 }
             }
         }
@@ -15020,10 +15922,12 @@ private fun parseComposerDate(value: String): Instant? =
 
 @Composable
 private fun ComposerSettingsDialog(
+    api: KarotterApi,
     initial: ComposerSettings,
     circles: List<ApiCircle>,
     communities: List<ApiCommunity>,
     onDismiss: () -> Unit,
+    onCircleCreated: (ApiCircle) -> Unit,
     onSave: (ComposerSettings) -> Unit
 ) {
     var communityId by remember { mutableStateOf(initial.communityId) }
@@ -15046,7 +15950,19 @@ private fun ComposerSettingsDialog(
         mutableStateOf(initial.expiresAt?.let(::parseTimestamp)?.let(::formatComposerDate) ?: formatComposerDate(Instant.now().plusSeconds(86400)))
     }
     var validationError by remember { mutableStateOf<String?>(null) }
+    var circleCreationTarget by remember { mutableStateOf<String?>(null) }
 
+    circleCreationTarget?.let { target ->
+        CreateCircleDialog(
+            api = api,
+            onDismiss = { circleCreationTarget = null },
+            onCreated = { created ->
+                onCircleCreated(created)
+                if (target == "VIEWER") viewerCircleId = created.id else replyCircleId = created.id
+                circleCreationTarget = null
+            }
+        )
+    }
     fun save() {
         val now = Instant.now()
         val scheduled = if (scheduledEnabled) parseComposerDate(scheduledText) else null
@@ -15140,7 +16056,12 @@ private fun ComposerSettingsDialog(
                         }
                         if (visibility == "CIRCLE") {
                             Spacer(Modifier.height(9.dp))
-                            CircleChoices(circles, viewerCircleId) { viewerCircleId = it }
+                            CircleChoices(
+                                circles = circles,
+                                selectedId = viewerCircleId,
+                                onCreate = { circleCreationTarget = "VIEWER" },
+                                onSelect = { viewerCircleId = it }
+                            )
                         }
                     }
                 }
@@ -15153,7 +16074,12 @@ private fun ComposerSettingsDialog(
                         ) { replyRestriction = it }
                         if (replyRestriction == "CIRCLE") {
                             Spacer(Modifier.height(9.dp))
-                            CircleChoices(circles, replyCircleId) { replyCircleId = it }
+                            CircleChoices(
+                                circles = circles,
+                                selectedId = replyCircleId,
+                                onCreate = { circleCreationTarget = "REPLY" },
+                                onSelect = { replyCircleId = it }
+                            )
                         }
                     }
                 }
@@ -15259,11 +16185,26 @@ private fun SettingsChoiceRow(options: List<Pair<String, String>>, selected: Str
 }
 
 @Composable
-private fun CircleChoices(circles: List<ApiCircle>, selectedId: Long?, onSelect: (Long) -> Unit) {
-    if (circles.isEmpty()) {
-        KText("利用できるサークルがありません", 10, Muted)
-    } else {
+private fun CircleChoices(
+    circles: List<ApiCircle>,
+    selectedId: Long?,
+    onCreate: () -> Unit,
+    onSelect: (Long) -> Unit
+) {
+    Column {
         LazyRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+            item(key = "create-circle") {
+                Row(
+                    Modifier.clip(RoundedCornerShape(11.dp)).background(PaleCarrot)
+                        .border(1.dp, Carrot.copy(alpha = .35f), RoundedCornerShape(11.dp))
+                        .clickable { onCreate() }.padding(horizontal = 11.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    CustomIcon(IconType.PLUS, Carrot, 13.dp)
+                    Spacer(Modifier.width(5.dp))
+                    KText("新規作成", 9, Carrot, FontWeight.Black)
+                }
+            }
             items(circles, key = { it.id }) { circle ->
                 val active = selectedId == circle.id
                 Box(
@@ -15271,6 +16212,95 @@ private fun CircleChoices(circles: List<ApiCircle>, selectedId: Long?, onSelect:
                         .border(1.dp, if (active) Strong else Hairline, RoundedCornerShape(11.dp))
                         .clickable { onSelect(circle.id) }.padding(horizontal = 12.dp, vertical = 8.dp)
                 ) { KText(circle.name, 9, if (active) OnStrong else Muted, FontWeight.Bold) }
+            }
+        }
+        if (circles.isEmpty()) {
+            Spacer(Modifier.height(7.dp))
+            KText("サークルがありません。新規作成から追加できます", 9, Muted)
+        }
+    }
+}
+
+@Composable
+private fun CreateCircleDialog(
+    api: KarotterApi,
+    onDismiss: () -> Unit,
+    onCreated: (ApiCircle) -> Unit
+) {
+    var name by remember { mutableStateOf("") }
+    var creating by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    Dialog(onDismissRequest = { if (!creating) onDismiss() }) {
+        Column(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp)).background(Surface)
+                .border(1.dp, Hairline, RoundedCornerShape(24.dp)).padding(22.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.size(42.dp).background(PaleCarrot, RoundedCornerShape(14.dp)),
+                    contentAlignment = Alignment.Center
+                ) { CustomIcon(IconType.PLUS, Carrot, 20.dp) }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    KText("サークルを作成", 17, Ink, FontWeight.Black)
+                    KText("公開範囲に使うメンバーグループ", 9, Muted)
+                }
+                Box(
+                    Modifier.size(34.dp).border(1.dp, Hairline, CircleShape)
+                        .clickable(enabled = !creating) { onDismiss() },
+                    contentAlignment = Alignment.Center
+                ) { CustomIcon(IconType.CLOSE, Ink, 15.dp) }
+            }
+            Spacer(Modifier.height(19.dp))
+            KText("サークル名", 10, Muted, FontWeight.Bold)
+            Spacer(Modifier.height(7.dp))
+            BasicTextField(
+                value = name,
+                onValueChange = { name = it.take(50); error = null },
+                singleLine = true,
+                textStyle = TextStyle(Ink, 14.sp, FontWeight.Bold),
+                cursorBrush = androidx.compose.ui.graphics.SolidColor(Carrot),
+                modifier = Modifier.fillMaxWidth().height(48.dp).background(Paper, RoundedCornerShape(14.dp))
+                    .border(1.dp, Hairline, RoundedCornerShape(14.dp)).padding(horizontal = 14.dp),
+                decorationBox = { inner ->
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                        if (name.isBlank()) KText("例：親しい友だち", 13, Muted)
+                        inner()
+                    }
+                }
+            )
+            error?.let {
+                Spacer(Modifier.height(10.dp))
+                ErrorText(it)
+            }
+            Spacer(Modifier.height(18.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                Box(
+                    Modifier.weight(1f).border(1.dp, Hairline, RoundedCornerShape(14.dp))
+                        .clickable(enabled = !creating) { onDismiss() }.padding(vertical = 12.dp),
+                    contentAlignment = Alignment.Center
+                ) { KText("キャンセル", 11, Ink, FontWeight.Bold) }
+                val canCreate = name.isNotBlank() && !creating
+                Box(
+                    Modifier.weight(1f).background(if (canCreate) Carrot else Hairline, RoundedCornerShape(14.dp))
+                        .clickable(enabled = canCreate) {
+                            creating = true
+                            error = null
+                            scope.launch {
+                                when (val result = withContext(Dispatchers.IO) { api.createCircle(name) }) {
+                                    is ApiResult.Success -> onCreated(result.value)
+                                    is ApiResult.Failure -> {
+                                        error = result.message
+                                        creating = false
+                                    }
+                                }
+                            }
+                        }.padding(vertical = 12.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    KText(if (creating) "作成中…" else "作成", 11, if (canCreate) Color.White else Muted, FontWeight.Black)
+                }
             }
         }
     }
@@ -15569,6 +16599,8 @@ private val ProtectedMarkdownTokenPattern = Regex("\\uE000(\\d+)\\uE001")
 private val QuotedRubyPattern = Regex("\"([^\"\\n]{1,60})\"《([^《》\\n]{1,80})》")
 private val BarRubyPattern = Regex("[|｜]([^《\\n]{1,60})《([^《》\\n]{1,80})》")
 private val TextSpoilerPattern = Regex("\\|\\|([\\s\\S]+?)\\|\\|")
+private val SubtextMarkerPattern = Regex("(?m)^-#[ \\t]?")
+private val SourceSubtextMarkerPattern = Regex("(?m)^-#")
 
 private fun richMarkdown(source: String): String {
     var value = source.take(20_000)
@@ -15581,6 +16613,7 @@ private fun richMarkdown(source: String): String {
         "\$\$${match.groupValues[1]}\$\$"
     }
     value = SingleDollarMathPattern.replace(value) { "\$\$${it.groupValues[1]}\$\$" }
+    value = SourceSubtextMarkerPattern.replace(value, "-\\#")
     val protected = mutableListOf<String>()
     value = ProtectedMarkdownPattern.replace(value) { match ->
         protected += match.value
@@ -15619,6 +16652,23 @@ private fun applyRubySpans(view: TextView, textColor: Int, textSizePx: Float) {
             start + base.length,
             Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
         )
+    }
+    view.text = builder
+}
+
+private fun applySubtextSpans(view: TextView, mutedColor: Int) {
+    val matches = SubtextMarkerPattern.findAll(view.text.toString()).toList()
+    if (matches.isEmpty()) return
+    val builder = SpannableStringBuilder(view.text)
+    matches.asReversed().forEach { match ->
+        val lineStart = match.range.first
+        val markerEnd = match.range.last + 1
+        builder.delete(lineStart, markerEnd)
+        val lineEnd = builder.indexOf('\n', lineStart).let { if (it < 0) builder.length else it }
+        if (lineStart < lineEnd) {
+            builder.setSpan(RelativeSizeSpan(.82f), lineStart, lineEnd, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+            builder.setSpan(ForegroundColorSpan(mutedColor), lineStart, lineEnd, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
     }
     view.text = builder
 }
@@ -15795,6 +16845,7 @@ private fun RichContentText(
             view.ellipsize = if (maxLines == Int.MAX_VALUE) null else TextUtils.TruncateAt.END
             runCatching {
                 markwon.setMarkdown(view, richMarkdown(text))
+                applySubtextSpans(view, Muted.toArgb())
                 applyRubySpans(view, color.toArgb(), textPx)
                 applyTextSpoilerSpans(
                     view = view,
