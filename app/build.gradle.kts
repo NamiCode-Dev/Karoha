@@ -12,8 +12,8 @@ android {
         applicationId = "social.karotter.client"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "0.1.8"
+        versionCode = 11
+        versionName = "0.1.9"
     }
 
     buildFeatures { compose = true }
@@ -44,6 +44,7 @@ dependencies {
     implementation("org.conscrypt:conscrypt-android:2.5.3")
     implementation("io.noties.markwon:core:4.6.2")
     implementation("io.noties.markwon:linkify:4.6.2")
+    implementation("io.noties.markwon:image:4.6.2")
     implementation("io.noties.markwon:inline-parser:4.6.2")
     implementation("io.noties.markwon:ext-latex:4.6.2")
     implementation("io.noties.markwon:ext-strikethrough:4.6.2")

@@ -216,6 +216,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import io.noties.markwon.LinkResolver
 import io.noties.markwon.Markwon
+import io.noties.markwon.image.ImagesPlugin
 import io.noties.markwon.SoftBreakAddsNewLinePlugin
 import io.noties.markwon.ext.latex.JLatexMathPlugin
 import io.noties.markwon.inlineparser.MarkwonInlineParserPlugin
@@ -473,7 +474,13 @@ private sealed interface Overlay {
     data class Notifications(
         val retainedState: NotificationsRetainedState = NotificationsRetainedState()
     ) : Overlay
+    data class LikedPosts(
+        val initialPosts: List<Post>,
+        val retainedState: LikedPostsRetainedState = LikedPostsRetainedState(initialPosts)
+    ) : Overlay
 }
+
+private data class OverlayNavigationTarget(val depth: Int, val overlay: Overlay?)
 
 private data class ComposeTarget(
     val parent: Post? = null,
@@ -649,6 +656,12 @@ private class NotificationsRetainedState {
     val loadedType = mutableStateOf<String?>(null)
     val readMarked = mutableStateOf(false)
     val filterListState = LazyListState()
+    val listState = LazyListState()
+}
+
+private class LikedPostsRetainedState(initialPosts: List<Post>) {
+    val posts = mutableStateOf(initialPosts)
+    val detailsLoaded = mutableStateOf(false)
     val listState = LazyListState()
 }
 
@@ -1200,6 +1213,9 @@ private fun MainShell(
     var storyCreatorOpen by remember { mutableStateOf(false) }
     var overlayStack by remember { mutableStateOf<List<Overlay>>(emptyList()) }
     val overlay = overlayStack.lastOrNull()
+    val overlayNavigationTarget = if (composerOpen) OverlayNavigationTarget(0, null)
+    else OverlayNavigationTarget(overlayStack.size, overlay)
+    val overlayTravelPx = with(LocalDensity.current) { 44.dp.roundToPx() }
     var posts by remember { mutableStateOf<List<Post>>(emptyList()) }
     var stories by remember { mutableStateOf<List<ApiStory>>(emptyList()) }
     var storiesLoading by remember { mutableStateOf(true) }
@@ -2050,14 +2066,24 @@ private fun MainShell(
             }
         }
 
-        AnimatedVisibility(
-            visible = overlay != null && !composerOpen,
-            modifier = Modifier.hazeSource(state = bottomDockHazeState, zIndex = 2f),
-            enter = slideInHorizontally(tween(360)) { it } + fadeIn(),
-            exit = slideOutHorizontally(tween(280)) { it } + fadeOut()
-        ) {
-            BackHandler(enabled = overlayStack.isNotEmpty()) { popOverlay() }
-            when (val target = overlay) {
+        AnimatedContent(
+            targetState = overlayNavigationTarget,
+            modifier = Modifier.fillMaxSize().hazeSource(state = bottomDockHazeState, zIndex = 2f),
+            contentKey = { it.depth },
+            transitionSpec = {
+                val opening = targetState.depth > initialState.depth
+                (slideInHorizontally(tween(320, easing = FastOutSlowInEasing)) {
+                    if (opening) overlayTravelPx else -overlayTravelPx
+                } + fadeIn(tween(190)))
+                    .togetherWith(
+                        slideOutHorizontally(tween(260, easing = FastOutSlowInEasing)) {
+                            if (opening) -overlayTravelPx / 2 else overlayTravelPx
+                        } + fadeOut(tween(150))
+                    )
+            },
+            label = "overlay-stack-navigation"
+        ) { navigationTarget ->
+            when (val target = navigationTarget.overlay) {
                 is Overlay.PostDetail -> PostDetailScreen(target.post, api, ::popOverlay, { openComposer(parent = it) }, { openComposer(quote = it) }, ::rekarot, ::like, ::bookmark, { pushOverlay(Overlay.UserDetail(it)) })
                 is Overlay.UserDetail -> UserDetailScreen(target.post, target.retainedState, api, currentUser?.id, ::popOverlay, { pushOverlay(Overlay.PostDetail(it)) }, { openComposer(parent = it) }, { openComposer(quote = it) }, ::rekarot, ::like, ::bookmark, { openComposer() }, ::startDirectMessage) { pushOverlay(Overlay.UserDetail(it.toProfilePost())) }
                 is Overlay.StoryDetail -> StoryDetailScreen(
@@ -2103,7 +2129,31 @@ private fun MainShell(
                     onLeft = ::popOverlay
                 )
                 is Overlay.HashtagSearch -> HashtagSearchScreen(target.tag, api, ::popOverlay, { pushOverlay(Overlay.PostDetail(it)) }, { openComposer(parent = it) }, { openComposer(quote = it) }, ::rekarot, ::like, ::bookmark, { pushOverlay(Overlay.UserDetail(it.toProfilePost())) }, { openComposer() })
-                is Overlay.Notifications -> NotificationsScreen(api, target.retainedState, ::popOverlay) { pushOverlay(Overlay.PostDetail(it)) }
+                is Overlay.Notifications -> NotificationsScreen(
+                    api = api,
+                    retainedState = target.retainedState,
+                    onBack = ::popOverlay,
+                    onPost = { pushOverlay(Overlay.PostDetail(it)) },
+                    onReply = { openComposer(parent = it) },
+                    onQuote = { openComposer(quote = it) },
+                    onRekarot = ::rekarot,
+                    onLike = ::like,
+                    onBookmark = ::bookmark,
+                    onLikedPosts = { posts ->
+                        pushOverlay(Overlay.LikedPosts(posts.map(ApiPost::toUiPost)))
+                    }
+                )
+                is Overlay.LikedPosts -> LikedPostsScreen(
+                    api = api,
+                    retainedState = target.retainedState,
+                    onBack = ::popOverlay,
+                    onPost = { pushOverlay(Overlay.PostDetail(it)) },
+                    onReply = { openComposer(parent = it) },
+                    onQuote = { openComposer(quote = it) },
+                    onRekarot = ::rekarot,
+                    onLike = ::like,
+                    onBookmark = ::bookmark
+                )
                 null -> Unit
             }
         }
@@ -3408,6 +3458,48 @@ private fun HomeScreen(
             modifier = Modifier.align(Alignment.TopCenter).zIndex(2f)
         ) { homeFilters() }
     }
+    ScrollToTopButton(
+        state = homeListState,
+        modifier = Modifier.align(Alignment.TopCenter).padding(
+            top = when {
+                !filtersPinned -> 14.dp
+                selectedMode == "trending" || selectedMode.startsWith("community:") -> 64.dp
+                else -> 116.dp
+            }
+        )
+    )
+    }
+}
+
+@Composable
+private fun ScrollToTopButton(
+    state: LazyListState,
+    modifier: Modifier = Modifier,
+    thresholdItems: Int = 4
+) {
+    val scope = rememberCoroutineScope()
+    AnimatedVisibility(
+        visible = state.firstVisibleItemIndex >= thresholdItems,
+        modifier = modifier.zIndex(8f),
+        enter = fadeIn(tween(180)) + slideInVertically(tween(240, easing = FastOutSlowInEasing)) { -it / 2 },
+        exit = fadeOut(tween(150)) + slideOutVertically(tween(200, easing = FastOutSlowInEasing)) { -it / 2 }
+    ) {
+        Row(
+            Modifier
+                .shadow(8.dp, RoundedCornerShape(18.dp), ambientColor = Color.Black.copy(.12f), spotColor = Color.Black.copy(.16f))
+                .clip(RoundedCornerShape(18.dp))
+                .background(Surface.copy(alpha = .96f))
+                .border(1.dp, Hairline, RoundedCornerShape(18.dp))
+                .clickable {
+                    scope.launch { state.animateScrollToItem(0) }
+                }
+                .padding(horizontal = 13.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            CustomIcon(IconType.CHEVRON_UP, Carrot, 14.dp)
+            KText("一番上へ", 10, Ink, FontWeight.Black, maxLines = 1)
+        }
     }
 }
 
@@ -6571,6 +6663,10 @@ private fun CommunityDetailScreen(
             }
             }
         }
+        ScrollToTopButton(
+            state = listState,
+            modifier = Modifier.align(Alignment.TopCenter).padding(top = if (communityTabsPinned) 114.dp else 66.dp)
+        )
         Column(
             Modifier.align(Alignment.BottomEnd).padding(end = 20.dp, bottom = 82.dp),
             horizontalAlignment = Alignment.End,
@@ -6646,6 +6742,10 @@ private fun BoardScreen(
                 Box(Modifier.padding(start = 91.dp).fillMaxWidth().height(1.dp).background(Hairline))
             }
         }
+        ScrollToTopButton(
+            state = listState,
+            modifier = Modifier.align(Alignment.TopCenter).padding(top = 14.dp)
+        )
         Column(
             Modifier.align(Alignment.BottomEnd).padding(end = 20.dp, bottom = 82.dp),
             horizontalAlignment = Alignment.End,
@@ -7600,6 +7700,10 @@ private fun SearchResultsScreen(
             } else if (tabLoading && resultCount > 0) item { LoadingPost() }
         }
         }
+        ScrollToTopButton(
+            state = listState,
+            modifier = Modifier.align(Alignment.TopCenter).padding(top = if (selectedTab == 0) 160.dp else 110.dp)
+        )
         Column(
             Modifier.align(Alignment.BottomEnd).padding(end = 20.dp, bottom = safeBottom + 78.dp),
             horizontalAlignment = Alignment.End,
@@ -7692,6 +7796,10 @@ private fun HashtagSearchScreen(tag: String, api: KarotterApi, onBack: () -> Uni
                 if (loading && posts.isNotEmpty()) item { LoadingPost() }
             }
         }
+        ScrollToTopButton(
+            state = listState,
+            modifier = Modifier.align(Alignment.TopCenter).padding(top = 78.dp)
+        )
         Column(
             Modifier.align(Alignment.BottomEnd).padding(end = 20.dp, bottom = bottomDockInset + 18.dp),
             horizontalAlignment = Alignment.End,
@@ -9185,7 +9293,18 @@ private fun BoardThreadComposer(
 }
 
 @Composable
-private fun NotificationsScreen(api: KarotterApi, retainedState: NotificationsRetainedState, onBack: () -> Unit, onPost: (Post) -> Unit) {
+private fun NotificationsScreen(
+    api: KarotterApi,
+    retainedState: NotificationsRetainedState,
+    onBack: () -> Unit,
+    onPost: (Post) -> Unit,
+    onReply: (Post) -> Unit,
+    onQuote: (Post) -> Unit,
+    onRekarot: (Post, Boolean) -> Unit,
+    onLike: (Post, Boolean) -> Unit,
+    onBookmark: (Post, Boolean) -> Unit,
+    onLikedPosts: (List<ApiPost>) -> Unit
+) {
     var notifications by retainedState.notifications
     var loading by retainedState.loading
     var nextPage by retainedState.nextPage
@@ -9277,7 +9396,8 @@ private fun NotificationsScreen(api: KarotterApi, retainedState: NotificationsRe
     InfiniteLoadEffect(listState, notifications.size, hasMore, loading) {
         scope.launch { loadNextPage() }
     }
-    Column(Modifier.fillMaxSize().background(Paper)) {
+    Box(Modifier.fillMaxSize().background(Paper)) {
+    Column(Modifier.fillMaxSize()) {
         OverlayHeader("通知", onBack)
         LazyRow(
             state = retainedState.filterListState,
@@ -9312,6 +9432,10 @@ private fun NotificationsScreen(api: KarotterApi, retainedState: NotificationsRe
             if (!loading && error == null && notifications.isEmpty()) item { KText("新しい通知はありません", 12, Muted, modifier = Modifier.padding(22.dp)) }
             items(notifications, key = ::notificationKey) { notice ->
                 val kind = notice.type.uppercase()
+                val targetPosts = notice.posts.ifEmpty { listOfNotNull(notice.post) }
+                    .distinctBy { it.id }
+                val likedPostCount = notice.postCount.coerceAtLeast(targetPosts.size)
+                val multipleLikedPosts = kind == "LIKE" && likedPostCount > 1
                 val accent = when (kind) {
                     "LIKE" -> Color(0xFFE65772)
                     "REACTION" -> Color(0xFF8A5BD1)
@@ -9325,14 +9449,20 @@ private fun NotificationsScreen(api: KarotterApi, retainedState: NotificationsRe
                     "COMMUNITY_REMOVAL" -> Color(0xFFD64045)
                     else -> Muted
                 }
+                Column(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
                 Row(
-                    Modifier
-                        .padding(horizontal = 14.dp, vertical = 5.dp)
+                    Modifier.padding(horizontal = 14.dp)
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(19.dp))
                         .background(Surface)
                         .border(1.dp, Hairline, RoundedCornerShape(19.dp))
-                        .clickable(enabled = notice.post != null) { notice.post?.toUiPost()?.let(onPost) }
+                        .clickable(enabled = targetPosts.isNotEmpty()) {
+                            if (multipleLikedPosts) {
+                                onLikedPosts(targetPosts)
+                            } else {
+                                targetPosts.firstOrNull()?.toUiPost()?.let(onPost)
+                            }
+                        }
                         .padding(14.dp),
                     verticalAlignment = Alignment.Top
                 ) {
@@ -9368,14 +9498,21 @@ private fun NotificationsScreen(api: KarotterApi, retainedState: NotificationsRe
                             KText(relativeTime(notice.createdAt), 9, Muted)
                         }
                         Spacer(Modifier.height(3.dp))
-                        KText(notice.message.ifBlank { notificationLabel(notice.type) }, 12, Ink.copy(.78f), lineHeight = 18f)
-                        notice.post?.content?.takeIf { it.isNotBlank() }?.let {
+                        KText(
+                            if (multipleLikedPosts) "${notice.actorName}さんがあなたの${likedPostCount}件の投稿にいいねしました"
+                            else notice.message.ifBlank { notificationLabel(notice.type) },
+                            12,
+                            Ink.copy(.78f),
+                            lineHeight = 18f
+                        )
+                        notice.post?.content?.takeIf { !multipleLikedPosts && it.isNotBlank() }?.let {
                             Spacer(Modifier.height(8.dp))
                             Box(Modifier.fillMaxWidth().background(Paper, RoundedCornerShape(10.dp)).padding(horizontal = 10.dp, vertical = 8.dp)) {
                                 KText(it, 10, Muted, lineHeight = 15f, maxLines = 2)
                             }
                         }
                     }
+                }
                 }
             }
             if (hasMore && notifications.isNotEmpty()) {
@@ -9385,6 +9522,69 @@ private fun NotificationsScreen(api: KarotterApi, retainedState: NotificationsRe
                 }
             } else if (loading && notifications.isNotEmpty()) item { LoadingPost() }
         }
+    }
+    ScrollToTopButton(
+        state = listState,
+        modifier = Modifier.align(Alignment.TopCenter).padding(top = 126.dp)
+    )
+    }
+}
+
+@Composable
+private fun LikedPostsScreen(
+    api: KarotterApi,
+    retainedState: LikedPostsRetainedState,
+    onBack: () -> Unit,
+    onPost: (Post) -> Unit,
+    onReply: (Post) -> Unit,
+    onQuote: (Post) -> Unit,
+    onRekarot: (Post, Boolean) -> Unit,
+    onLike: (Post, Boolean) -> Unit,
+    onBookmark: (Post, Boolean) -> Unit
+) {
+    var posts by retainedState.posts
+    var detailsLoaded by retainedState.detailsLoaded
+    val listState = retainedState.listState
+    LaunchedEffect(Unit) {
+        if (!detailsLoaded) {
+            val completePosts = withContext(Dispatchers.IO) {
+                posts.map { summaryPost ->
+                    val postId = summaryPost.id ?: return@map summaryPost
+                    when (val result = api.post(postId)) {
+                        is ApiResult.Success -> result.value.toUiPost()
+                        is ApiResult.Failure -> summaryPost
+                    }
+                }
+            }
+            posts = completePosts
+            detailsLoaded = true
+        }
+    }
+    Box(Modifier.fillMaxSize().background(Paper)) {
+        Column(Modifier.fillMaxSize()) {
+            OverlayHeader("いいねされた投稿", onBack)
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                contentPadding = PaddingValues(bottom = 30.dp)
+            ) {
+                items(posts, key = ::postStableKey) { likedPost ->
+                    PostCard(
+                        post = likedPost,
+                        onOpen = onPost,
+                        onReply = onReply,
+                        onQuote = onQuote,
+                        onRekarot = { desired -> onRekarot(likedPost, desired) },
+                        onLike = { desired -> onLike(likedPost, desired) },
+                        onBookmark = { desired -> onBookmark(likedPost, desired) }
+                    )
+                }
+            }
+        }
+        ScrollToTopButton(
+            state = listState,
+            modifier = Modifier.align(Alignment.TopCenter).padding(top = 78.dp)
+        )
     }
 }
 
@@ -14289,6 +14489,10 @@ private fun SharedProfilePage(user: ApiUser, isOwn: Boolean, api: KarotterApi, o
         if (!profileContentLocked && selectedKind != "media" && !loadingMore && userPosts.isEmpty()) item { KText("このタブにはまだ表示できる投稿がありません", 12, Muted, modifier = Modifier.padding(22.dp)) }
     }
     }
+    ScrollToTopButton(
+        state = listState,
+        modifier = Modifier.align(Alignment.TopCenter).padding(top = if (onBack != null) 112.dp else 58.dp)
+    )
     if (onProfileReload != null || onCompose != null) {
         Column(
             Modifier.align(Alignment.BottomEnd).padding(end = 20.dp, bottom = bottomDockInset + 18.dp),
@@ -16599,11 +16803,15 @@ private val ProtectedMarkdownTokenPattern = Regex("\\uE000(\\d+)\\uE001")
 private val QuotedRubyPattern = Regex("\"([^\"\\n]{1,60})\"《([^《》\\n]{1,80})》")
 private val BarRubyPattern = Regex("[|｜]([^《\\n]{1,60})《([^《》\\n]{1,80})》")
 private val TextSpoilerPattern = Regex("\\|\\|([\\s\\S]+?)\\|\\|")
+private val RelativeMarkdownDestinationPattern = Regex("(\\]\\()(/[^)\\s]+)(?=\\s*(?:[\\\"'][^)]*[\\\"'])?\\))")
 private val SubtextMarkerPattern = Regex("(?m)^-#[ \\t]?")
 private val SourceSubtextMarkerPattern = Regex("(?m)^-#")
 
 private fun richMarkdown(source: String): String {
     var value = source.take(20_000)
+    value = RelativeMarkdownDestinationPattern.replace(value) { match ->
+        "${match.groupValues[1]}https://karotter.com${match.groupValues[2]}"
+    }
         .replace("\r\n", "\n")
         .replace('\r', '\n')
     value = BlockLatexPattern.replace(value) { match ->
@@ -16801,6 +17009,7 @@ private fun RichContentText(
     val markwon = remember(context, textPx, color, mentionHandler, hashtagHandler) {
         Markwon.builder(context)
             .usePlugin(MarkwonInlineParserPlugin.create())
+            .usePlugin(ImagesPlugin.create())
             .usePlugin(SoftBreakAddsNewLinePlugin.create())
             .usePlugin(LinkifyPlugin.create())
             .usePlugin(io.noties.markwon.ext.strikethrough.StrikethroughPlugin.create())
@@ -16815,7 +17024,15 @@ private fun RichContentText(
             .usePlugin(object : io.noties.markwon.AbstractMarkwonPlugin() {
                 override fun configureConfiguration(builder: io.noties.markwon.MarkwonConfiguration.Builder) {
                     builder.linkResolver(LinkResolver { _, link ->
-                        if (link.startsWith("karotter://user/") && mentionHandler != null) {
+                        val parsedLink = runCatching { Uri.parse(link) }.getOrNull()
+                        val profileUsername = parsedLink
+                            ?.takeIf { it.host.equals("karotter.com", ignoreCase = true) }
+                            ?.pathSegments
+                            ?.takeIf { it.size >= 2 && it.first().equals("profile", ignoreCase = true) }
+                            ?.get(1)
+                        if (profileUsername != null && mentionHandler != null) {
+                            mentionHandler.invoke(Uri.decode(profileUsername))
+                        } else if (link.startsWith("karotter://user/") && mentionHandler != null) {
                             mentionHandler.invoke(link.substringAfterLast('/'))
                         } else if (link.startsWith("karotter://tag/") && hashtagHandler != null) {
                             hashtagHandler.invoke(Uri.decode(link.substringAfterLast('/')))

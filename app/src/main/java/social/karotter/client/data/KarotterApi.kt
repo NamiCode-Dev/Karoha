@@ -236,7 +236,9 @@ data class ApiNotification(
     val actorUsername: String? = null,
     val suppressed: Boolean = false,
     val isRead: Boolean = false,
-    val notificationCount: Int = 1
+    val notificationCount: Int = 1,
+    val posts: List<ApiPost> = emptyList(),
+    val postCount: Int = if (post == null) 0 else 1
 )
 data class ApiQuestion(
     val id: Long,
@@ -1581,7 +1583,18 @@ class KarotterApi(context: Context) {
             for (i in 0 until array.length()) {
                 val n = array.optJSONObject(i) ?: continue
                 val actor = n.optJSONObject("actor") ?: n.optJSONArray("actors")?.optJSONObject(0)
-                val postJson = n.optJSONObject("post") ?: n.optJSONArray("posts")?.optJSONObject(0)
+                val postObjects = buildList {
+                    n.optJSONObject("post")?.let(::add)
+                    n.optJSONArray("posts")?.let { postsArray ->
+                        for (postIndex in 0 until postsArray.length()) {
+                            postsArray.optJSONObject(postIndex)?.let(::add)
+                        }
+                    }
+                }
+                val parsedPosts = postObjects.mapNotNull { postObject ->
+                    runCatching { parsePost(postObject) }.getOrNull()
+                }.distinctBy(ApiPost::id)
+                val parsedPost = parsedPosts.firstOrNull()
                 val actorName = actor?.optString("displayName", actor.optString("username"))?.takeIf { it.isNotBlank() } ?: "Karotter"
                 val type = n.optString("type", "SYSTEM")
                 val notificationIds = n.optJSONArray("notificationIds")
@@ -1590,11 +1603,13 @@ class KarotterApi(context: Context) {
                     absolute(actor?.optString("avatarUrl")),
                     n.optString("message").takeIf { it.isNotBlank() && it != "null" } ?: notificationMessage(type, actorName, n.optInt("actorCount", 1)),
                     n.optString("createdAt"),
-                    postJson?.let { runCatching { parsePost(it) }.getOrNull() },
+                    parsedPost,
                     actor?.optString("username")?.takeIf { it.isNotBlank() && it != "null" },
                     suppressed = shouldSuppressNotification(n),
                     isRead = n.optBoolean("isRead", false),
-                    notificationCount = notificationIds?.length()?.takeIf { it > 0 } ?: 1
+                    notificationCount = notificationIds?.length()?.takeIf { it > 0 } ?: 1,
+                    posts = parsedPosts,
+                    postCount = n.optInt("postCount", parsedPosts.size).coerceAtLeast(parsedPosts.size)
                 ))
             }
         }
