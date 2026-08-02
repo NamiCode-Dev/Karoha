@@ -41,6 +41,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -52,6 +53,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.keyframes
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -408,6 +410,7 @@ private val LocalPostInteractionStates = staticCompositionLocalOf<Map<Long, Post
 private val LocalPostMenuEnvironment = staticCompositionLocalOf<PostMenuEnvironment?> { null }
 private val LocalPostMenuResultHandler = staticCompositionLocalOf<((PostMenuAction, Post) -> Unit)?> { null }
 private val LocalNavigationActive = staticCompositionLocalOf { true }
+private val LocalOverlayNavigationActive = staticCompositionLocalOf { false }
 private val LocalLinkPreviewApi = staticCompositionLocalOf<KarotterApi?> { null }
 private val LocalViewerIsPro = staticCompositionLocalOf { false }
 private val LocalShowReactions = staticCompositionLocalOf { true }
@@ -1216,6 +1219,17 @@ private fun MainShell(
     val overlayNavigationTarget = if (composerOpen) OverlayNavigationTarget(0, null)
     else OverlayNavigationTarget(overlayStack.size, overlay)
     val overlayTravelPx = with(LocalDensity.current) { 44.dp.roundToPx() }
+    val searchBaseCovered = section == Section.SEARCH && overlayStack.isNotEmpty()
+    val searchBaseTranslationX by animateFloatAsState(
+        targetValue = if (searchBaseCovered) -overlayTravelPx.toFloat() else 0f,
+        animationSpec = tween(320, easing = FastOutSlowInEasing),
+        label = "searchBaseNavigationTranslation"
+    )
+    val searchBaseAlpha by animateFloatAsState(
+        targetValue = if (searchBaseCovered) 0f else 1f,
+        animationSpec = tween(190),
+        label = "searchBaseNavigationAlpha"
+    )
     var posts by remember { mutableStateOf<List<Post>>(emptyList()) }
     var stories by remember { mutableStateOf<List<ApiStory>>(emptyList()) }
     var storiesLoading by remember { mutableStateOf(true) }
@@ -1821,12 +1835,24 @@ private fun MainShell(
             },
             label = "section"
         ) { current ->
-            CompositionLocalProvider(LocalNavigationActive provides (current == section)) {
+            CompositionLocalProvider(
+                LocalNavigationActive provides (current == section),
+                LocalOverlayNavigationActive provides (overlayStack.isNotEmpty() || composerOpen)
+            ) {
                 Box(
-                    Modifier.fillMaxSize().then(
-                        if (current == Section.HOME) Modifier
-                        else Modifier.hazeSource(state = bottomDockHazeState, zIndex = 0f)
-                    )
+                    Modifier.fillMaxSize()
+                        .then(
+                            if (current == Section.SEARCH) {
+                                Modifier.graphicsLayer {
+                                    translationX = searchBaseTranslationX
+                                    alpha = searchBaseAlpha
+                                }
+                            } else Modifier
+                        )
+                        .then(
+                            if (current == Section.HOME) Modifier
+                            else Modifier.hazeSource(state = bottomDockHazeState, zIndex = 0f)
+                        )
                 ) {
                 when (current) {
                 Section.HOME -> HomeScreen(
@@ -2072,14 +2098,19 @@ private fun MainShell(
             contentKey = { it.depth },
             transitionSpec = {
                 val opening = targetState.depth > initialState.depth
-                (slideInHorizontally(tween(320, easing = FastOutSlowInEasing)) {
+                ((slideInHorizontally(tween(320, easing = FastOutSlowInEasing)) {
                     if (opening) overlayTravelPx else -overlayTravelPx
                 } + fadeIn(tween(190)))
                     .togetherWith(
-                        slideOutHorizontally(tween(260, easing = FastOutSlowInEasing)) {
-                            if (opening) -overlayTravelPx / 2 else overlayTravelPx
-                        } + fadeOut(tween(150))
+                        slideOutHorizontally(tween(320, easing = FastOutSlowInEasing)) {
+                            if (opening) -overlayTravelPx else overlayTravelPx
+                        } + fadeOut(tween(190))
+                    )).using(
+                    SizeTransform(
+                        clip = false,
+                        sizeAnimationSpec = { _, _ -> snap() }
                     )
+                )
             },
             label = "overlay-stack-navigation"
         ) { navigationTarget ->
@@ -6873,7 +6904,11 @@ private fun DiscoverScreen(api: KarotterApi, externalRequest: Pair<String, Long>
             mediaRefreshing = false
         }
     }
-    BackHandler(enabled = submittedQuery != null && LocalNavigationActive.current) { closeResults() }
+    BackHandler(
+        enabled = submittedQuery != null &&
+            LocalNavigationActive.current &&
+            !LocalOverlayNavigationActive.current
+    ) { closeResults() }
     LaunchedEffect(Unit) {
         when (val result = withContext(Dispatchers.IO) { api.trendingTopics() }) { is ApiResult.Success -> trends = result.value; is ApiResult.Failure -> Unit }
     }
